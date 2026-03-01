@@ -1,0 +1,22 @@
+# Core scientific stack
+numpy
+pandas
+matplotlib
+seaborn
+scipy
+
+# Single-cell / spatial transcriptomics
+scanpy
+anndata
+squidpy
+spatialdata
+spatialdata-io
+spatialdata-plot
+annsel
+
+# Storage
+zarr
+
+# Jupyter support
+jupyter
+ipykernel

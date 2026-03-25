@@ -1,21 +1,35 @@
 # Core scientific stack
 numpy
 pandas
+scipy
 matplotlib
 seaborn
-scipy
+tqdm
 
 # Single-cell / spatial transcriptomics
-scanpy
 anndata
+scanpy
 squidpy
 spatialdata
 spatialdata-io
 spatialdata-plot
 annsel
 
-# Storage
+# ML / deep learning
+torch
+
+# Storage and tabular formats
 zarr
+h5py
+pyarrow
+
+# Parallel / dataframe backends
+dask[dataframe]
+
+# Data access (used in BEP notebooks outside BEP- as well)
+huggingface_hub
+hest
+fsspec
 
 # Jupyter support
 jupyter

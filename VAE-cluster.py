@@ -6,6 +6,7 @@ from pathlib import Path
 
 import anndata as ad
 import annsel as an
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -21,6 +22,7 @@ from scipy.sparse import csr_matrix, issparse
 from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
 from tqdm.auto import tqdm
 
+matplotlib.use("Agg")
 
 # Load all saved Xenium samples as AnnData only (.h5ad)
 

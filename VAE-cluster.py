@@ -24,288 +24,33 @@ from tqdm.auto import tqdm
 
 matplotlib.use("Agg")
 
-# Load all saved Xenium samples as AnnData only (.h5ad)
+# -----------------------------------------------------------------------------
+# Paths / I/O
+# -----------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/tudelft.net/staff-umbrella/Xeniumenhancer")).resolve()
 ANN_DIR = Path(os.environ.get("ANN_DIR", PROJECT_ROOT / "AnnData")).resolve()
 SAVE_DIR = Path(os.environ.get("OUTPUT_DIR", PROJECT_ROOT / "outputs")).resolve()
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-READ_MODE = os.environ.get("READ_MODE") or None
-
+# Default to backed mode on the cluster so X stays on disk
+READ_MODE = os.environ.get("READ_MODE", "r") or "r"
 
 def _adata_path(sample_id: str):
     return ANN_DIR / f"{sample_id}_xenium_cell_level.h5ad"
 
-
-def _load_sample(sample_id: str, read_mode=READ_MODE):
+def _load_sample_backed(sample_id: str, read_mode=READ_MODE):
     h5ad_path = _adata_path(sample_id)
     if not h5ad_path.exists():
         raise FileNotFoundError(f"Missing h5ad for {sample_id}: {h5ad_path}")
     return sc.read_h5ad(h5ad_path, backed=read_mode)
 
-
-# Discover available sample IDs from written h5ad files
-available_ids = sorted(
-    p.name.replace("_xenium_cell_level.h5ad", "")
-    for p in ANN_DIR.glob("*_xenium_cell_level.h5ad")
-)
-
-ids_to_load = available_ids
-adatas_raw = {}
-load_failed = []
-
-for sample_id in ids_to_load:
-    try:
-        adatas_raw[sample_id] = _load_sample(sample_id)
-    except Exception as e:
-        load_failed.append((sample_id, str(e)))
-
-# Working copy
-adatas = dict(adatas_raw)
-
-print(f"Loaded samples: {len(adatas_raw)}")
-print(f"Read mode: {'backed (r)' if READ_MODE == 'r' else 'in-memory'}")
-for sample_id, ad in adatas_raw.items():
-    print(f"  {sample_id}: {ad.shape}")
-
-if load_failed:
-    print(f"Failed to load {len(load_failed)} sample(s):")
-    for sid, msg in load_failed[:10]:
-        print(f"  - {sid}: {msg}")
-
+# -----------------------------------------------------------------------------
+# Fixed split definitions
+# -----------------------------------------------------------------------------
 
 threshold = 40
 genes_threshold = 5
-
-# Filter every loaded panel/sample
-adatas_f = {}
-for panel_name, ad in adatas_raw.items():
-    # Start from an in-memory object so slicing/copy works for both backed and non-backed AnnData.
-    ad_qc = ad.to_memory() if getattr(ad, "isbacked", False) else ad.copy()
-
-    # Ensure required QC fields exist for each panel.
-    if not {"total_counts", "n_genes_by_counts"}.issubset(ad_qc.obs.columns):
-        sc.pp.calculate_qc_metrics(ad_qc, inplace=True, percent_top=(50, 100))
-
-    panel_mask = (
-        (ad_qc.obs["total_counts"] >= threshold)
-        & (ad_qc.obs["n_genes_by_counts"] > genes_threshold)
-    )
-
-    ad_cells = ad_qc[panel_mask].copy()
-    gene_names = pd.Index(ad_cells.var_names).astype(str)
-    keep_genes = (
-    ~gene_names.str.startswith("UnassignedCodeword", na=False)
-    & ~gene_names.str.lower().str.startswith("antisense", na=False)
-    )
-    adatas_f[panel_name] = ad_cells[:, keep_genes].copy()
-
-# Refresh working copies used later in the notebook
-adatas = dict(adatas_f)
-
-# Report filtering impact for all panels
-for panel_name in sorted(adatas_raw.keys()):
-    n_before = adatas_raw[panel_name].n_obs
-    n_after = adatas_f[panel_name].n_obs
-    n_removed = n_before - n_after
-    pct_removed = (100.0 * n_removed / n_before) if n_before else 0.0
-    print(
-        f"{panel_name}: before={n_before}, after={n_after}, "
-        f"removed={n_removed} ({pct_removed:.1f}%)"
-    )
-
-
-def make_multiple_v1_like_corruptions(
-    adata_input,
-    p_non_overlap_values,
-    base_seed=0,
-):
-    """
-    Create multiple corrupted versions of one AnnData object by sweeping p values.
-    For each p in p_non_overlap_values:
-    1) Start with a per-gene base vector filled with p.
-    2) Binomially thin each nonzero count entry.
-    """
-    p_values = np.atleast_1d(np.asarray(p_non_overlap_values, dtype=np.float64))
-
-    if np.any((p_values < 0.0) | (p_values > 1.0)):
-        raise ValueError("All p_non_overlap_values must be between 0 and 1.")
-
-    X = adata_input.X
-    X = X.tocsr() if sp.issparse(X) else sp.csr_matrix(X)
-
-    # Check if the structure of adata is correct
-    if X.data.size > 0:
-        if np.any(X.data < 0):
-            raise ValueError("adata_input.X contains negative values (expected raw counts).")
-        if np.issubdtype(X.data.dtype, np.floating):
-            frac = np.abs(X.data - np.rint(X.data))
-            if np.nanmax(frac) > 1e-6:
-                raise ValueError("adata_input.X looks non-integer (use raw counts)")
-
-    # Round the data to integers
-    data_int = np.rint(X.data).astype(np.int64, copy=False)
-
-    adata_versions = []
-    p_versions = []
-    p_base_versions = []
-
-    # for each p value, create a new corrupted version of the input adata
-    for rep, p_non_overlap in enumerate(p_values):
-        p_base = np.full(adata_input.n_vars, float(p_non_overlap), dtype=np.float64)
-        p_rep = p_base.copy()
-
-        # bionomial thinning by drawwing fro the distiribution for each nonzero entry
-        rng = np.random.default_rng(base_seed + rep)
-        p_entry = p_rep[X.indices]
-        data_new = rng.binomial(data_int, p_entry).astype(np.int64, copy=False)
-
-        # Keep the CSR structure consistent, and drop the zeros
-        X_new = sp.csr_matrix(
-            (data_new, X.indices.copy(), X.indptr.copy()),
-            shape=X.shape,
-        )
-        X_new.eliminate_zeros()
-
-        # Create the new Anndata object and calculate the QC metrics
-        adata_rep = adata_input.copy()
-        adata_rep.X = X_new
-        sc.pp.calculate_qc_metrics(adata_rep, inplace=True, percent_top=None)
-
-        adata_versions.append(adata_rep)
-        p_versions.append(p_rep)
-        p_base_versions.append(p_base)
-
-    return adata_versions, p_versions, p_base_versions
-
-p_non_overlap_values = [0.15, 0.17, 0.19, 0.21, 0.23, 0.25, 0.27, 0.29, 0.31, 0.33, 0.35, 0.37, 0.40]
-
-# Basic conditional-style VAE reconstruction (GPU-optimized)
-
-def _to_dense_float32(X):
-    if sp.issparse(X):
-        return X.toarray().astype(np.float32)
-    return np.asarray(X, dtype=np.float32)
-
-
-class PanelRowAccessor:
-    """Accesses rows from multiple AnnData panels in one shared gene order.
-       Used by training and eval datasets to have consistent gene indexing for different panels """
-
-    def __init__(self, panel_data, panel_ids, common_genes):
-        self.panel_defs = []
-        self.panel_sizes = []
-        self.common_genes = pd.Index(common_genes).astype(str)
-
-        # For each panel, we have to determine how its genes map to the common gene space
-        for sid in panel_ids:
-            ad_panel = panel_data[sid]
-            # Match the panel genes to the shared genes so keep track of the position of the common genes
-            idx = pd.Index(ad_panel.var_names).astype(str).get_indexer(self.common_genes)
-            present_mask = idx >= 0
-
-            # Get local panel columns for present genes 
-            panel_pos = idx[present_mask].astype(np.int64, copy=False)
-            # Get global output positions for those same genes
-            common_pos = np.where(present_mask)[0].astype(np.int64, copy=False)
-
-            if panel_pos.size == 0:
-                raise ValueError(f"Panel {sid} has zero overlap with the training gene space.")
-
-            # store the mappings and sizes (for when retrieving rows)
-            self.panel_defs.append((ad_panel, panel_pos, common_pos))
-            self.panel_sizes.append(int(ad_panel.n_obs))
-
-        # After processing all panels, we can compute cumulative sizes for fast row indexing
-        self.panel_sizes = np.asarray(self.panel_sizes, dtype=np.int64)
-        self.cum_sizes = np.cumsum(self.panel_sizes)
-        self.total_cells = int(self.cum_sizes[-1]) if self.cum_sizes.size else 0
-        self.n_genes = int(len(self.common_genes))
-
-    # Given a global cell index, determine which panel it belongs to and the local row index within that panel
-    def _locate(self, global_cell_idx):
-        if global_cell_idx < 0 or global_cell_idx >= self.total_cells:
-            raise IndexError("Cell index out of range.")
-        panel_idx = int(np.searchsorted(self.cum_sizes, global_cell_idx, side="right"))
-        prev_cum = 0 if panel_idx == 0 else int(self.cum_sizes[panel_idx - 1])
-        within_panel_idx = int(global_cell_idx - prev_cum)
-        return panel_idx, within_panel_idx
-
-    # Retrieves the specified row as a dense vector in the common gene space, filling missing genes with zeros
-    def get_row_dense(self, global_cell_idx):
-        panel_idx, row_idx = self._locate(global_cell_idx)
-        ad_panel, panel_pos, common_pos = self.panel_defs[panel_idx]
-
-        row = ad_panel.X[row_idx, panel_pos]
-        if sp.issparse(row):
-            row_vals = row.toarray().ravel().astype(np.float32, copy=False)
-        else:
-            row_vals = np.asarray(row, dtype=np.float32).ravel()
-
-        y = np.zeros(self.n_genes, dtype=np.float32)
-        y[common_pos] = row_vals
-        return np.clip(y, 0.0, None)
-
-
-class MultiVersionTrainDataset(Dataset):
-    def __init__(self, panel_data, panel_ids, common_genes, p_non_overlap_values, base_seed=0):
-        self.rows = PanelRowAccessor(panel_data, panel_ids, common_genes)
-        self.n_train = self.rows.total_cells
-        self.n_genes = self.rows.n_genes
-        self.base_seed = int(base_seed)
-
-        self.p_values = np.atleast_1d(np.asarray(p_non_overlap_values, dtype=np.float64))
-        if self.p_values.size < 1:
-            raise ValueError("p_non_overlap_values must contain at least one value.")
-        if np.any((self.p_values < 0.0) | (self.p_values > 1.0)):
-            raise ValueError("All p_non_overlap_values must be between 0 and 1.")
-
-        self.n_versions = int(self.p_values.size)
-        self.p_versions = []
-        for _, p_non_overlap in enumerate(self.p_values):
-            p_rep = np.full(self.n_genes, float(p_non_overlap), dtype=np.float32)
-            self.p_versions.append(p_rep)
-
-    def __len__(self):
-        return self.n_versions * self.n_train
-
-    def __getitem__(self, idx):
-        version_idx = idx // self.n_train
-        within_idx = idx % self.n_train
-
-        y = self.rows.get_row_dense(within_idx)
-        x = y.copy()
-
-        nz = x > 0
-        if np.any(nz):
-            counts = np.rint(x[nz]).astype(np.int64, copy=False)
-            counts = np.clip(counts, 0, None)
-            rng = np.random.default_rng(self.base_seed + version_idx * 1_000_003 + within_idx)
-            p_entry = self.p_versions[version_idx][nz]
-            x[nz] = rng.binomial(counts, p_entry).astype(np.float32, copy=False)
-
-        return torch.from_numpy(x), torch.from_numpy(y)
-
-
-class CleanEvalDataset(Dataset):
-    """Validation/test dataset with clean inputs and clean targets (no corruption)."""
-
-    def __init__(self, panel_data, panel_ids, common_genes):
-        self.rows = PanelRowAccessor(panel_data, panel_ids, common_genes)
-        self.n_cells = self.rows.total_cells
-
-    def __len__(self):
-        return self.n_cells
-
-    def __getitem__(self, idx):
-        y = self.rows.get_row_dense(idx)
-        x = y.copy()
-        return torch.from_numpy(x), torch.from_numpy(y)
-
-# Build panel-wise denoising data lazily to avoid giant dense matrices in RAM
-
-panel_data = adatas  # Filtered per-sample AnnData objects from earlier QC
 p_non_overlap_values = [0.15, 0.17, 0.19, 0.21, 0.23, 0.25, 0.27, 0.29, 0.31, 0.33, 0.35, 0.37, 0.40]
 base_seed = 42
 
@@ -332,28 +77,134 @@ split_samples_test_c = [
 ]
 split_samples_test = split_samples_test_a + split_samples_test_b + split_samples_test_c
 
-def _select_available_ids(sample_ids, panel_dict):
+def _select_available_ids(sample_ids, available_like):
+    available_set = set(available_like)
     normalized = [str(s).strip().upper() for s in sample_ids]
-    found = [sid for sid in normalized if sid in panel_dict]
-    missing = [sid for sid in normalized if sid not in panel_dict]
+    found = [sid for sid in normalized if sid in available_set]
+    missing = [sid for sid in normalized if sid not in available_set]
     return found, missing
 
-train_panel_ids, missing_train = _select_available_ids(split_samples_train, panel_data)
-val_panel_ids, missing_val = _select_available_ids(split_samples_val, panel_data)
-test_panel_ids, missing_test = _select_available_ids(split_samples_test, panel_data)
-test_a_panel_ids, _ = _select_available_ids(split_samples_test_a, panel_data)
-test_b_panel_ids, _ = _select_available_ids(split_samples_test_b, panel_data)
-test_c_panel_ids, _ = _select_available_ids(split_samples_test_c, panel_data)
+# -----------------------------------------------------------------------------
+# Lightweight panel preparation
+# -----------------------------------------------------------------------------
+
+def _compute_qc_chunked(adata_backed, chunk_size=4096):
+    """
+    Compute total_counts and n_genes_by_counts without loading the whole matrix.
+    Only used if those QC columns are missing from .obs.
+    """
+    n = adata_backed.n_obs
+    total_counts = np.zeros(n, dtype=np.float64)
+    n_genes_by_counts = np.zeros(n, dtype=np.int32)
+
+    for start in range(0, n, chunk_size):
+        stop = min(start + chunk_size, n)
+        X_chunk = adata_backed.X[start:stop]
+
+        if sp.issparse(X_chunk):
+            X_chunk = X_chunk.tocsr()
+            total_counts[start:stop] = np.asarray(X_chunk.sum(axis=1)).ravel()
+            # Number of stored nonzero entries per row
+            n_genes_by_counts[start:stop] = np.diff(X_chunk.indptr)
+        else:
+            X_chunk = np.asarray(X_chunk)
+            total_counts[start:stop] = X_chunk.sum(axis=1)
+            n_genes_by_counts[start:stop] = np.count_nonzero(X_chunk, axis=1)
+
+    return total_counts, n_genes_by_counts
+
+def _prepare_panel_metadata(sample_id: str, threshold: int, genes_threshold: int):
+    """
+    Keep the matrix backed on disk and store only:
+      - filtered row indices
+      - filtered gene indices
+      - filtered gene names
+    """
+    ad_panel = _load_sample_backed(sample_id)
+
+    if {"total_counts", "n_genes_by_counts"}.issubset(ad_panel.obs.columns):
+        total_counts = ad_panel.obs["total_counts"].to_numpy(copy=True)
+        n_genes_by_counts = ad_panel.obs["n_genes_by_counts"].to_numpy(copy=True)
+    else:
+        print(f"{sample_id}: QC columns missing, computing them chunk-wise from backed X.")
+        total_counts, n_genes_by_counts = _compute_qc_chunked(ad_panel)
+
+    cell_mask = (
+        (total_counts >= threshold)
+        & (n_genes_by_counts > genes_threshold)
+    )
+    cell_pos = np.flatnonzero(cell_mask).astype(np.int64, copy=False)
+
+    gene_names_full = pd.Index(ad_panel.var_names).astype(str)
+    keep_gene_mask = (
+        ~gene_names_full.str.startswith("UnassignedCodeword", na=False)
+        & ~gene_names_full.str.lower().str.startswith("antisense", na=False)
+    )
+    keep_gene_mask = np.asarray(keep_gene_mask, dtype=bool)
+    gene_pos_all = np.flatnonzero(keep_gene_mask).astype(np.int64, copy=False)
+    gene_names_filtered = gene_names_full[keep_gene_mask]
+
+    return {
+        "adata": ad_panel,                   # backed AnnData handle
+        "cell_pos": cell_pos,               # kept rows in original X
+        "gene_pos_all": gene_pos_all,       # kept cols in original X
+        "gene_names": gene_names_filtered,  # names after gene filtering
+        "n_obs_raw": int(ad_panel.n_obs),
+        "n_obs_filtered": int(cell_pos.size),
+    }
+
+# -----------------------------------------------------------------------------
+# Load only requested samples, and keep them backed on disk
+# -----------------------------------------------------------------------------
+
+available_ids = sorted(
+    p.name.replace("_xenium_cell_level.h5ad", "")
+    for p in ANN_DIR.glob("*_xenium_cell_level.h5ad")
+)
+available_set = set(available_ids)
+
+train_panel_ids, missing_train = _select_available_ids(split_samples_train, available_set)
+val_panel_ids, missing_val = _select_available_ids(split_samples_val, available_set)
+test_panel_ids, missing_test = _select_available_ids(split_samples_test, available_set)
+test_a_panel_ids, _ = _select_available_ids(split_samples_test_a, available_set)
+test_b_panel_ids, _ = _select_available_ids(split_samples_test_b, available_set)
+test_c_panel_ids, _ = _select_available_ids(split_samples_test_c, available_set)
+
+requested_ids = sorted(set(train_panel_ids + val_panel_ids + test_panel_ids))
+
+panel_data = {}
+load_failed = []
+
+for sample_id in requested_ids:
+    try:
+        panel_data[sample_id] = _prepare_panel_metadata(
+            sample_id=sample_id,
+            threshold=threshold,
+            genes_threshold=genes_threshold,
+        )
+    except Exception as e:
+        load_failed.append((sample_id, str(e)))
+
+# Drop any samples that failed to open from the split lists
+train_panel_ids = [sid for sid in train_panel_ids if sid in panel_data]
+val_panel_ids = [sid for sid in val_panel_ids if sid in panel_data]
+test_panel_ids = [sid for sid in test_panel_ids if sid in panel_data]
+test_a_panel_ids = [sid for sid in test_a_panel_ids if sid in panel_data]
+test_b_panel_ids = [sid for sid in test_b_panel_ids if sid in panel_data]
+test_c_panel_ids = [sid for sid in test_c_panel_ids if sid in panel_data]
 
 if len(train_panel_ids) == 0:
-    raise ValueError("No train panels from split_samples_train are present in `adatas`.")
+    raise ValueError("No train panels from split_samples_train are present in `panel_data`.")
 if len(val_panel_ids) == 0:
-    raise ValueError("No validation panels from split_samples_val are present in `adatas`.")
+    raise ValueError("No validation panels from split_samples_val are present in `panel_data`.")
 if len(test_panel_ids) == 0:
-    raise ValueError("No test panels from split_samples_test are present in `adatas`.")
+    raise ValueError("No test panels from split_samples_test are present in `panel_data`.")
+
+print(f"Loaded requested panels: {len(panel_data)}")
+print(f"Read mode: backed ({READ_MODE})")
 
 if missing_train or missing_val or missing_test:
-    print("Requested sample IDs missing from loaded panel_data:")
+    print("Requested sample IDs missing from disk:")
     if missing_train:
         print(f"  train missing: {missing_train}")
     if missing_val:
@@ -361,25 +212,189 @@ if missing_train or missing_val or missing_test:
     if missing_test:
         print(f"  test missing: {missing_test}")
 
-# Define model gene space from training panels only.
-all_panel_ids = train_panel_ids
-common_genes = pd.Index(panel_data[all_panel_ids[0]].var_names).astype(str)
-for sid in all_panel_ids[1:]:
-    common_genes = common_genes.intersection(pd.Index(panel_data[sid].var_names).astype(str))
+if load_failed:
+    print(f"Failed to load {len(load_failed)} sample(s):")
+    for sid, msg in load_failed[:10]:
+        print(f"  - {sid}: {msg}")
+
+for sid in requested_ids:
+    if sid not in panel_data:
+        continue
+    rec = panel_data[sid]
+    n_before = rec["n_obs_raw"]
+    n_after = rec["n_obs_filtered"]
+    n_removed = n_before - n_after
+    pct_removed = (100.0 * n_removed / n_before) if n_before else 0.0
+    print(
+        f"{sid}: before={n_before}, after={n_after}, "
+        f"removed={n_removed} ({pct_removed:.1f}%), kept_genes={len(rec['gene_names'])}"
+    )
+
+# -----------------------------------------------------------------------------
+# Helper
+# -----------------------------------------------------------------------------
+
+def _to_dense_float32(X):
+    if sp.issparse(X):
+        return X.toarray().astype(np.float32)
+    return np.asarray(X, dtype=np.float32)
+
+# -----------------------------------------------------------------------------
+# Row accessor that works from backed AnnData + stored masks
+# -----------------------------------------------------------------------------
+
+class PanelRowAccessor:
+    """Access rows from multiple backed AnnData panels in one shared gene order."""
+
+    def __init__(self, panel_data, panel_ids, common_genes):
+        self.panel_defs = []
+        self.panel_sizes = []
+        self.common_genes = pd.Index(common_genes).astype(str)
+
+        for sid in panel_ids:
+            rec = panel_data[sid]
+
+            # Map this panel's filtered genes onto the shared train gene space
+            idx = rec["gene_names"].get_indexer(self.common_genes)
+            present_mask = idx >= 0
+
+            # Positions in the panel's filtered gene list
+            filtered_pos = idx[present_mask].astype(np.int64, copy=False)
+
+            # Convert to original X column positions
+            panel_pos = rec["gene_pos_all"][filtered_pos]
+
+            # Output positions in the common gene vector
+            common_pos = np.flatnonzero(present_mask).astype(np.int64, copy=False)
+
+            if panel_pos.size == 0:
+                raise ValueError(f"Panel {sid} has zero overlap with the training gene space.")
+
+            # Some backed backends are happier with sorted column indices
+            order = np.argsort(panel_pos)
+            panel_pos = panel_pos[order]
+            common_pos = common_pos[order]
+
+            self.panel_defs.append((
+                rec["adata"],       # backed AnnData
+                rec["cell_pos"],    # kept rows in original X
+                panel_pos,          # original X cols for common genes
+                common_pos,         # output positions in shared vector
+            ))
+            self.panel_sizes.append(int(rec["cell_pos"].size))
+
+        self.panel_sizes = np.asarray(self.panel_sizes, dtype=np.int64)
+        self.cum_sizes = np.cumsum(self.panel_sizes)
+        self.total_cells = int(self.cum_sizes[-1]) if self.cum_sizes.size else 0
+        self.n_genes = int(len(self.common_genes))
+
+    def _locate(self, global_cell_idx):
+        if global_cell_idx < 0 or global_cell_idx >= self.total_cells:
+            raise IndexError("Cell index out of range.")
+        panel_idx = int(np.searchsorted(self.cum_sizes, global_cell_idx, side="right"))
+        prev_cum = 0 if panel_idx == 0 else int(self.cum_sizes[panel_idx - 1])
+        within_panel_idx = int(global_cell_idx - prev_cum)
+        return panel_idx, within_panel_idx
+
+    def get_row_dense(self, global_cell_idx):
+        panel_idx, row_idx = self._locate(global_cell_idx)
+        ad_panel, cell_pos, panel_pos, common_pos = self.panel_defs[panel_idx]
+
+        orig_row_idx = int(cell_pos[row_idx])
+        row = ad_panel.X[orig_row_idx, panel_pos]
+
+        if sp.issparse(row):
+            row_vals = row.toarray().ravel().astype(np.float32, copy=False)
+        else:
+            row_vals = np.asarray(row, dtype=np.float32).ravel()
+
+        y = np.zeros(self.n_genes, dtype=np.float32)
+        y[common_pos] = row_vals
+        return np.clip(y, 0.0, None)
+
+# -----------------------------------------------------------------------------
+# Datasets
+# -----------------------------------------------------------------------------
+
+class MultiVersionTrainDataset(Dataset):
+    def __init__(self, panel_data, panel_ids, common_genes, p_non_overlap_values, base_seed=0):
+        self.rows = PanelRowAccessor(panel_data, panel_ids, common_genes)
+        self.n_train = self.rows.total_cells
+        self.n_genes = self.rows.n_genes
+        self.base_seed = int(base_seed)
+
+        self.p_values = np.atleast_1d(np.asarray(p_non_overlap_values, dtype=np.float64))
+        if self.p_values.size < 1:
+            raise ValueError("p_non_overlap_values must contain at least one value.")
+        if np.any((self.p_values < 0.0) | (self.p_values > 1.0)):
+            raise ValueError("All p_non_overlap_values must be between 0 and 1.")
+
+        self.n_versions = int(self.p_values.size)
+        self.p_versions = []
+        for p_non_overlap in self.p_values:
+            p_rep = np.full(self.n_genes, float(p_non_overlap), dtype=np.float32)
+            self.p_versions.append(p_rep)
+
+    def __len__(self):
+        return self.n_versions * self.n_train
+
+    def __getitem__(self, idx):
+        version_idx = idx // self.n_train
+        within_idx = idx % self.n_train
+
+        y = self.rows.get_row_dense(within_idx)
+        x = y.copy()
+
+        nz = x > 0
+        if np.any(nz):
+            counts = np.rint(x[nz]).astype(np.int64, copy=False)
+            counts = np.clip(counts, 0, None)
+            rng = np.random.default_rng(self.base_seed + version_idx * 1_000_003 + within_idx)
+            p_entry = self.p_versions[version_idx][nz]
+            x[nz] = rng.binomial(counts, p_entry).astype(np.float32, copy=False)
+
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+class CleanEvalDataset(Dataset):
+    """Validation/test dataset with clean inputs and clean targets (no corruption)."""
+
+    def __init__(self, panel_data, panel_ids, common_genes):
+        self.rows = PanelRowAccessor(panel_data, panel_ids, common_genes)
+        self.n_cells = self.rows.total_cells
+
+    def __len__(self):
+        return self.n_cells
+
+    def __getitem__(self, idx):
+        y = self.rows.get_row_dense(idx)
+        x = y.copy()
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+# -----------------------------------------------------------------------------
+# Shared gene space from train panels only
+# -----------------------------------------------------------------------------
+
+common_genes = panel_data[train_panel_ids[0]]["gene_names"]
+for sid in train_panel_ids[1:]:
+    common_genes = common_genes.intersection(panel_data[sid]["gene_names"], sort=False)
+
 if len(common_genes) == 0:
     raise ValueError("No shared genes across selected training panels.")
 
 gene_names = common_genes.to_numpy()
 n_genes = len(gene_names)
 
-# Keep compatibility variables without allocating giant dense arrays.
+# Compatibility placeholders; no giant dense arrays are allocated
 X_inputs_model = [None] * len(p_non_overlap_values)
 X_inputs = X_inputs_model
 X_tgt = None
 Y_val = None
 Y_test = None
 
-# Build datasets.
+# -----------------------------------------------------------------------------
+# Build datasets
+# -----------------------------------------------------------------------------
+
 train_dataset = MultiVersionTrainDataset(
     panel_data=panel_data,
     panel_ids=train_panel_ids,
@@ -400,15 +415,13 @@ test_dataset = CleanEvalDataset(
     common_genes=common_genes,
 )
 
-# Split indices are split-local arrays.
 train_idx = np.arange(train_dataset.rows.total_cells, dtype=np.int64)
 val_idx = np.arange(len(val_dataset), dtype=np.int64)
 test_idx = np.arange(len(test_dataset), dtype=np.int64)
 
-# Panel-wise test subset sizes (A/B/C)
-test_a_cells = int(sum(panel_data[sid].n_obs for sid in test_a_panel_ids))
-test_b_cells = int(sum(panel_data[sid].n_obs for sid in test_b_panel_ids))
-test_c_cells = int(sum(panel_data[sid].n_obs for sid in test_c_panel_ids))
+test_a_cells = int(sum(panel_data[sid]["n_obs_filtered"] for sid in test_a_panel_ids))
+test_b_cells = int(sum(panel_data[sid]["n_obs_filtered"] for sid in test_b_panel_ids))
+test_c_cells = int(sum(panel_data[sid]["n_obs_filtered"] for sid in test_c_panel_ids))
 
 n_cells = len(train_idx)
 input_name = f"panel-wise lazy corruptions ({len(train_panel_ids)} train panels x {len(p_non_overlap_values)} p-values)"
@@ -420,11 +433,14 @@ print(f"Train/Val/Test panels: {len(train_panel_ids)} / {len(val_panel_ids)} / {
 print(f"Train/Val/Test cells: {train_dataset.rows.total_cells} / {len(val_dataset)} / {len(test_dataset)}")
 print(f"Test A/B/C cells: {test_a_cells} / {test_b_cells} / {test_c_cells}")
 print("Validation/Test inputs: clean (no corruption)")
-print("Training data mode: raw counts (lazy streaming)")
+print("Training data mode: raw counts (lazy streaming from backed h5ad)")
 print(f"Training examples: {len(train_dataset)}")
 print(f"Validation examples: {len(val_dataset)} | Test examples: {len(test_dataset)}")
 
-# Tunable hyperparameters 
+# -----------------------------------------------------------------------------
+# Hyperparameters
+# -----------------------------------------------------------------------------
+
 epochs = 60
 beta = 1e-3
 latent_dim = 16
@@ -433,11 +449,11 @@ learning_rate = 1e-3
 early_stop_patience = 5
 theta_init = 10.0
 pi_init = 0.1
-batch_size_cuda = 512
-batch_size_cpu = 256
 
+# If you still get killed, lower these first
+batch_size_cuda = 256
+batch_size_cpu = 128
 
-# Here we just do some device setup & let it run on the  CPU
 torch.set_float32_matmul_precision("high")
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
@@ -445,12 +461,12 @@ if use_cuda:
     torch.backends.cudnn.benchmark = True
 print(f"Running on device: {device}")
 
-
 batch_size = batch_size_cuda if use_cuda else batch_size_cpu
 loader_kwargs = {
     "num_workers": 0,
     "pin_memory": use_cuda,
 }
+
 train_loader = DataLoader(
     train_dataset,
     batch_size=batch_size,

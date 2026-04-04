@@ -25,6 +25,7 @@ from tqdm.auto import tqdm
 matplotlib.use("Agg")
 
 
+# Paths / I/O
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/tudelft.net/staff-umbrella/Xeniumenhancer")).resolve()
 ANN_DIR = Path(os.environ.get("ANN_DIR", PROJECT_ROOT / "AnnData")).resolve()
@@ -34,8 +35,10 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # Default to backed mode on the cluster so X stays on disk
 READ_MODE = os.environ.get("READ_MODE", "r") or "r"
 
+
 def _adata_path(sample_id: str):
     return ANN_DIR / f"{sample_id}_xenium_cell_level.h5ad"
+
 
 def _load_sample_backed(sample_id: str, read_mode=READ_MODE):
     h5ad_path = _adata_path(sample_id)
@@ -43,7 +46,7 @@ def _load_sample_backed(sample_id: str, read_mode=READ_MODE):
         raise FileNotFoundError(f"Missing h5ad for {sample_id}: {h5ad_path}")
     return sc.read_h5ad(h5ad_path, backed=read_mode)
 
-
+# Fixed split definitions / corruption setup
 threshold = 40
 genes_threshold = 5
 p_non_overlap_values = [0.15, 0.19, 0.23, 0.27, 0.31, 0.37]
@@ -72,6 +75,7 @@ split_samples_test_c = [
 ]
 split_samples_test = split_samples_test_a + split_samples_test_b + split_samples_test_c
 
+
 def _select_available_ids(sample_ids, available_like):
     available_set = set(available_like)
     normalized = [str(s).strip().upper() for s in sample_ids]
@@ -80,10 +84,12 @@ def _select_available_ids(sample_ids, available_like):
     return found, missing
 
 
+
+# Backed QC / metadata prep
+
 def _compute_qc_chunked(adata_backed, chunk_size=4096):
     """
     Compute total_counts and n_genes_by_counts without loading the whole matrix.
-    Only used if those QC columns are missing from .obs.
     """
     n = adata_backed.n_obs
     total_counts = np.zeros(n, dtype=np.float64)
@@ -96,7 +102,6 @@ def _compute_qc_chunked(adata_backed, chunk_size=4096):
         if sp.issparse(X_chunk):
             X_chunk = X_chunk.tocsr()
             total_counts[start:stop] = np.asarray(X_chunk.sum(axis=1)).ravel()
-            # Number of stored nonzero entries per row
             n_genes_by_counts[start:stop] = np.diff(X_chunk.indptr)
         else:
             X_chunk = np.asarray(X_chunk)
@@ -104,6 +109,7 @@ def _compute_qc_chunked(adata_backed, chunk_size=4096):
             n_genes_by_counts[start:stop] = np.count_nonzero(X_chunk, axis=1)
 
     return total_counts, n_genes_by_counts
+
 
 def _prepare_panel_metadata(sample_id: str, threshold: int, genes_threshold: int):
     """
@@ -146,8 +152,8 @@ def _prepare_panel_metadata(sample_id: str, threshold: int, genes_threshold: int
     }
 
 
-# Load only requested samples, and keep them backed on disk
 
+# Load only requested samples
 available_ids = sorted(
     p.name.replace("_xenium_cell_level.h5ad", "")
     for p in ANN_DIR.glob("*_xenium_cell_level.h5ad")
@@ -221,13 +227,13 @@ for sid in requested_ids:
         f"removed={n_removed} ({pct_removed:.1f}%), kept_genes={len(rec['gene_names'])}"
     )
 
-# Helper
+
+
 def _to_dense_float32(X):
     if sp.issparse(X):
         return X.toarray().astype(np.float32)
     return np.asarray(X, dtype=np.float32)
 
-# Row accessor that works from backed AnnData + stored masks
 
 class PanelRowAccessor:
     """Access rows from multiple backed AnnData panels in one shared gene order."""
@@ -256,7 +262,6 @@ class PanelRowAccessor:
             if panel_pos.size == 0:
                 raise ValueError(f"Panel {sid} has zero overlap with the training gene space.")
 
-            # Some backed backends are happier with sorted column indices
             order = np.argsort(panel_pos)
             panel_pos = panel_pos[order]
             common_pos = common_pos[order]
@@ -299,12 +304,93 @@ class PanelRowAccessor:
         return np.clip(y, 0.0, None)
 
 
-# Datasets
+def load_or_build_dense_split(
+    panel_data,
+    panel_ids,
+    common_genes,
+    cache_path,
+    dtype=np.float32,
+    chunk_size=2048,
+):
+    """
+    Build one dense matrix for a split in the shared gene space and cache it to disk.
+    Reuses the cache on later runs.
+    """
+    cache_path = Path(cache_path)
+
+    if cache_path.exists():
+        arr = np.load(cache_path, allow_pickle=False)
+        print(f"Loaded cached split: {cache_path} | shape={arr.shape} | dtype={arr.dtype}")
+        return arr
+
+    accessor = PanelRowAccessor(panel_data, panel_ids, common_genes)
+    Y = np.empty((accessor.total_cells, accessor.n_genes), dtype=dtype)
+
+    write_pos = 0
+    panel_pbar = tqdm(panel_ids, desc=f"Building {cache_path.stem}", unit="panel")
+
+    for sid in panel_pbar:
+        rec = panel_data[sid]
+
+        idx = rec["gene_names"].get_indexer(accessor.common_genes)
+        present_mask = idx >= 0
+
+        filtered_pos = idx[present_mask].astype(np.int64, copy=False)
+        panel_pos = rec["gene_pos_all"][filtered_pos]
+        common_pos = np.flatnonzero(present_mask).astype(np.int64, copy=False)
+
+        if panel_pos.size == 0:
+            raise ValueError(f"Panel {sid} has zero overlap with the training gene space.")
+
+        order = np.argsort(panel_pos)
+        panel_pos = panel_pos[order]
+        common_pos = common_pos[order]
+
+        cell_pos = rec["cell_pos"]
+        ad_panel = rec["adata"]
+        n_rows = int(cell_pos.size)
+
+        for start in range(0, n_rows, chunk_size):
+            stop = min(start + chunk_size, n_rows)
+            rows = cell_pos[start:stop]
+
+            # Fast path: try block loading from backed AnnData
+            try:
+                block = ad_panel[rows, panel_pos].X
+                if sp.issparse(block):
+                    block = block.toarray()
+                else:
+                    block = np.asarray(block)
+            except Exception:
+                # Fallback: row-by-row if backed fancy indexing fails
+                block_rows = []
+                for r in rows:
+                    row = ad_panel.X[int(r), panel_pos]
+                    if sp.issparse(row):
+                        row = row.toarray().ravel()
+                    else:
+                        row = np.asarray(row).ravel()
+                    block_rows.append(row)
+                block = np.vstack(block_rows)
+
+            block = block.astype(dtype, copy=False)
+
+            Y_block = np.zeros((block.shape[0], accessor.n_genes), dtype=dtype)
+            Y_block[:, common_pos] = block
+
+            Y[write_pos:write_pos + block.shape[0]] = Y_block
+            write_pos += block.shape[0]
+
+    np.save(cache_path, Y)
+    print(f"Saved cached split: {cache_path} | shape={Y.shape} | dtype={Y.dtype}")
+    return Y
+
+
+
 class MultiVersionTrainDataset(Dataset):
-    def __init__(self, panel_data, panel_ids, common_genes, p_non_overlap_values, base_seed=0):
-        self.rows = PanelRowAccessor(panel_data, panel_ids, common_genes)
-        self.n_train = self.rows.total_cells
-        self.n_genes = self.rows.n_genes
+    def __init__(self, clean_matrix, p_non_overlap_values, base_seed=0):
+        self.Y = np.ascontiguousarray(clean_matrix, dtype=np.float32)
+        self.n_train, self.n_genes = self.Y.shape
         self.base_seed = int(base_seed)
 
         self.p_values = np.atleast_1d(np.asarray(p_non_overlap_values, dtype=np.float64))
@@ -326,7 +412,7 @@ class MultiVersionTrainDataset(Dataset):
         version_idx = idx // self.n_train
         within_idx = idx % self.n_train
 
-        y = self.rows.get_row_dense(within_idx)
+        y = self.Y[within_idx].copy()
         x = y.copy()
 
         nz = x > 0
@@ -339,8 +425,25 @@ class MultiVersionTrainDataset(Dataset):
 
         return torch.from_numpy(x), torch.from_numpy(y)
 
+
 class CleanEvalDataset(Dataset):
-    """Validation/test dataset with clean inputs and clean targets (no corruption)."""
+    """Validation dataset with clean inputs and clean targets (no corruption)."""
+
+    def __init__(self, clean_matrix):
+        self.Y = np.ascontiguousarray(clean_matrix, dtype=np.float32)
+        self.n_cells, self.n_genes = self.Y.shape
+
+    def __len__(self):
+        return self.n_cells
+
+    def __getitem__(self, idx):
+        y = self.Y[idx].copy()
+        x = y.copy()
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+
+class CleanEvalDatasetLazy(Dataset):
+    """Lazy test dataset with clean inputs and clean targets (no corruption)."""
 
     def __init__(self, panel_data, panel_ids, common_genes):
         self.rows = PanelRowAccessor(panel_data, panel_ids, common_genes)
@@ -366,35 +469,59 @@ if len(common_genes) == 0:
 gene_names = common_genes.to_numpy()
 n_genes = len(gene_names)
 
-# Compatibility placeholders; no giant dense arrays are allocated
-X_inputs_model = [None] * len(p_non_overlap_values)
-X_inputs = X_inputs_model
-X_tgt = None
-Y_val = None
-Y_test = None
 
+# Build / cache dense train + val matrices
 
-train_dataset = MultiVersionTrainDataset(
+CACHE_DIR = SAVE_DIR / "split_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+train_cache = CACHE_DIR / f"train_{len(train_panel_ids)}panels_{n_genes}genes.npy"
+val_cache = CACHE_DIR / f"val_{len(val_panel_ids)}panels_{n_genes}genes.npy"
+
+Y_train = load_or_build_dense_split(
     panel_data=panel_data,
     panel_ids=train_panel_ids,
     common_genes=common_genes,
+    cache_path=train_cache,
+    dtype=np.float32,
+    chunk_size=2048,
+)
+
+Y_val = load_or_build_dense_split(
+    panel_data=panel_data,
+    panel_ids=val_panel_ids,
+    common_genes=common_genes,
+    cache_path=val_cache,
+    dtype=np.float32,
+    chunk_size=2048,
+)
+
+# Compatibility placeholders
+X_inputs_model = [None] * len(p_non_overlap_values)
+X_inputs = X_inputs_model
+X_tgt = None
+Y_test = None
+
+
+
+train_dataset = MultiVersionTrainDataset(
+    clean_matrix=Y_train,
     p_non_overlap_values=p_non_overlap_values,
     base_seed=base_seed,
 )
 
 val_dataset = CleanEvalDataset(
-    panel_data=panel_data,
-    panel_ids=val_panel_ids,
-    common_genes=common_genes,
+    clean_matrix=Y_val,
 )
 
-test_dataset = CleanEvalDataset(
+# Keep test lazy because it is very large
+test_dataset = CleanEvalDatasetLazy(
     panel_data=panel_data,
     panel_ids=test_panel_ids,
     common_genes=common_genes,
 )
 
-train_idx = np.arange(train_dataset.rows.total_cells, dtype=np.int64)
+train_idx = np.arange(train_dataset.n_train, dtype=np.int64)
 val_idx = np.arange(len(val_dataset), dtype=np.int64)
 test_idx = np.arange(len(test_dataset), dtype=np.int64)
 
@@ -403,22 +530,21 @@ test_b_cells = int(sum(panel_data[sid]["n_obs_filtered"] for sid in test_b_panel
 test_c_cells = int(sum(panel_data[sid]["n_obs_filtered"] for sid in test_c_panel_ids))
 
 n_cells = len(train_idx)
-input_name = f"panel-wise lazy corruptions ({len(train_panel_ids)} train panels x {len(p_non_overlap_values)} p-values)"
+input_name = f"panel-wise cached train/val corruptions ({len(train_panel_ids)} train panels x {len(p_non_overlap_values)} p-values)"
 split_mode = "fixed panel/sample split (panel-wise)"
 
 print(f"Using input source: {input_name}")
 print(f"Shared genes (train-defined): {n_genes}")
 print(f"Train/Val/Test panels: {len(train_panel_ids)} / {len(val_panel_ids)} / {len(test_panel_ids)}")
-print(f"Train/Val/Test cells: {train_dataset.rows.total_cells} / {len(val_dataset)} / {len(test_dataset)}")
+print(f"Train/Val/Test cells: {train_dataset.n_train} / {len(val_dataset)} / {len(test_dataset)}")
 print(f"Test A/B/C cells: {test_a_cells} / {test_b_cells} / {test_c_cells}")
 print("Validation/Test inputs: clean (no corruption)")
-print("Training data mode: raw counts (lazy streaming from backed h5ad)")
+print("Training data mode: raw counts (train/val cached dense, test lazy)")
 print(f"Training examples: {len(train_dataset)}")
 print(f"Validation examples: {len(val_dataset)} | Test examples: {len(test_dataset)}")
 
 
 # Hyperparameters
-
 epochs = 40
 beta = 1e-3
 latent_dim = 16
@@ -427,8 +553,21 @@ learning_rate = 1e-3
 early_stop_patience = 5
 theta_init = 10.0
 pi_init = 0.1
+batch_size_cuda = 1024
+batch_size_cpu = 256
 
-# If you still get killed, lower these first
+# Hyperparameters
+
+epochs = 30
+beta = 1e-3
+latent_dim = 16
+hidden_dim = 256
+learning_rate = 1e-3
+early_stop_patience = 3
+theta_init = 10.0
+pi_init = 0.1
+
+# lower if processed gets killed immediately
 batch_size_cuda = 512
 batch_size_cpu = 128
 

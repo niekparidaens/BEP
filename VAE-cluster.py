@@ -24,9 +24,7 @@ from tqdm.auto import tqdm
 
 matplotlib.use("Agg")
 
-# -----------------------------------------------------------------------------
-# Paths / I/O
-# -----------------------------------------------------------------------------
+
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/tudelft.net/staff-umbrella/Xeniumenhancer")).resolve()
 ANN_DIR = Path(os.environ.get("ANN_DIR", PROJECT_ROOT / "AnnData")).resolve()
@@ -45,13 +43,10 @@ def _load_sample_backed(sample_id: str, read_mode=READ_MODE):
         raise FileNotFoundError(f"Missing h5ad for {sample_id}: {h5ad_path}")
     return sc.read_h5ad(h5ad_path, backed=read_mode)
 
-# -----------------------------------------------------------------------------
-# Fixed split definitions
-# -----------------------------------------------------------------------------
 
 threshold = 40
 genes_threshold = 5
-p_non_overlap_values = [0.15, 0.17, 0.19, 0.21, 0.23, 0.25, 0.27, 0.29, 0.31, 0.33, 0.35, 0.37, 0.40]
+p_non_overlap_values = [0.15, 0.19, 0.23, 0.27, 0.31, 0.37]
 base_seed = 42
 
 split_samples_train = [
@@ -84,9 +79,6 @@ def _select_available_ids(sample_ids, available_like):
     missing = [sid for sid in normalized if sid not in available_set]
     return found, missing
 
-# -----------------------------------------------------------------------------
-# Lightweight panel preparation
-# -----------------------------------------------------------------------------
 
 def _compute_qc_chunked(adata_backed, chunk_size=4096):
     """
@@ -153,9 +145,8 @@ def _prepare_panel_metadata(sample_id: str, threshold: int, genes_threshold: int
         "n_obs_filtered": int(cell_pos.size),
     }
 
-# -----------------------------------------------------------------------------
+
 # Load only requested samples, and keep them backed on disk
-# -----------------------------------------------------------------------------
 
 available_ids = sorted(
     p.name.replace("_xenium_cell_level.h5ad", "")
@@ -230,18 +221,13 @@ for sid in requested_ids:
         f"removed={n_removed} ({pct_removed:.1f}%), kept_genes={len(rec['gene_names'])}"
     )
 
-# -----------------------------------------------------------------------------
 # Helper
-# -----------------------------------------------------------------------------
-
 def _to_dense_float32(X):
     if sp.issparse(X):
         return X.toarray().astype(np.float32)
     return np.asarray(X, dtype=np.float32)
 
-# -----------------------------------------------------------------------------
 # Row accessor that works from backed AnnData + stored masks
-# -----------------------------------------------------------------------------
 
 class PanelRowAccessor:
     """Access rows from multiple backed AnnData panels in one shared gene order."""
@@ -312,10 +298,8 @@ class PanelRowAccessor:
         y[common_pos] = row_vals
         return np.clip(y, 0.0, None)
 
-# -----------------------------------------------------------------------------
-# Datasets
-# -----------------------------------------------------------------------------
 
+# Datasets
 class MultiVersionTrainDataset(Dataset):
     def __init__(self, panel_data, panel_ids, common_genes, p_non_overlap_values, base_seed=0):
         self.rows = PanelRowAccessor(panel_data, panel_ids, common_genes)
@@ -370,10 +354,8 @@ class CleanEvalDataset(Dataset):
         x = y.copy()
         return torch.from_numpy(x), torch.from_numpy(y)
 
-# -----------------------------------------------------------------------------
-# Shared gene space from train panels only
-# -----------------------------------------------------------------------------
 
+# Shared gene space from train panels only
 common_genes = panel_data[train_panel_ids[0]]["gene_names"]
 for sid in train_panel_ids[1:]:
     common_genes = common_genes.intersection(panel_data[sid]["gene_names"], sort=False)
@@ -391,9 +373,6 @@ X_tgt = None
 Y_val = None
 Y_test = None
 
-# -----------------------------------------------------------------------------
-# Build datasets
-# -----------------------------------------------------------------------------
 
 train_dataset = MultiVersionTrainDataset(
     panel_data=panel_data,
@@ -437,11 +416,10 @@ print("Training data mode: raw counts (lazy streaming from backed h5ad)")
 print(f"Training examples: {len(train_dataset)}")
 print(f"Validation examples: {len(val_dataset)} | Test examples: {len(test_dataset)}")
 
-# -----------------------------------------------------------------------------
-# Hyperparameters
-# -----------------------------------------------------------------------------
 
-epochs = 60
+# Hyperparameters
+
+epochs = 40
 beta = 1e-3
 latent_dim = 16
 hidden_dim = 256
@@ -451,7 +429,7 @@ theta_init = 10.0
 pi_init = 0.1
 
 # If you still get killed, lower these first
-batch_size_cuda = 256
+batch_size_cuda = 512
 batch_size_cpu = 128
 
 torch.set_float32_matmul_precision("high")

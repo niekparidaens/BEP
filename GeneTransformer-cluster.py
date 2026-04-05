@@ -760,31 +760,42 @@ class GeneTokenAutoencoder(nn.Module):
 
 
 def token_zinb_nll_matrix(mu_logit, pi_logit, theta_unconstrained, target_counts, eps=1e-8):
-    target_counts = target_counts.clamp_min(0.0)
+    target_counts = target_counts.clamp_min(0.0).float()
 
-    mu = F.softplus(mu_logit) + eps
-    pi = torch.sigmoid(pi_logit)
-    theta = F.softplus(theta_unconstrained) + eps
+    # Keep these in float32 for numerical stability
+    mu_logit = mu_logit.float()
+    pi_logit = pi_logit.float()
+    theta_unconstrained = theta_unconstrained.float()
 
-    log_theta_mu = torch.log(theta + mu + eps)
+    mu = F.softplus(mu_logit).clamp_min(eps)
+    theta = F.softplus(theta_unconstrained).clamp_min(eps)
+
+    # Stable log(pi) and log(1-pi) from logits
+    log_pi = -F.softplus(-pi_logit)   # log(sigmoid(pi_logit))
+    log_1m_pi = -F.softplus(pi_logit) # log(1 - sigmoid(pi_logit))
+
+    log_theta = torch.log(theta)
+    log_mu = torch.log(mu)
+    log_theta_mu = torch.log(theta + mu)
+
     nb_log_prob = (
         torch.lgamma(target_counts + theta)
         - torch.lgamma(theta)
         - torch.lgamma(target_counts + 1.0)
-        + theta * (torch.log(theta + eps) - log_theta_mu)
-        + target_counts * (torch.log(mu + eps) - log_theta_mu)
+        + theta * (log_theta - log_theta_mu)
+        + target_counts * (log_mu - log_theta_mu)
     )
 
-    zero_mask = target_counts < eps
-    nb_log_prob_zero = theta * (torch.log(theta + eps) - log_theta_mu)
+    nb_zero_log_prob = theta * (log_theta - log_theta_mu)
 
     zero_log_prob = torch.logaddexp(
-        torch.log(pi + eps),
-        torch.log1p(-pi + eps) + nb_log_prob_zero,
+        log_pi,
+        log_1m_pi + nb_zero_log_prob,
     )
-    nonzero_log_prob = torch.log1p(-pi + eps) + nb_log_prob
+    nonzero_log_prob = log_1m_pi + nb_log_prob
 
-    return -torch.where(zero_mask, zero_log_prob, nonzero_log_prob)
+    nll = -torch.where(target_counts < eps, zero_log_prob, nonzero_log_prob)
+    return nll
 
 
 def token_zinb_loss(mu_logit, pi_logit, theta_unconstrained, target_counts, attn_mask, eps=1e-8):
@@ -795,7 +806,10 @@ def token_zinb_loss(mu_logit, pi_logit, theta_unconstrained, target_counts, attn
         target_counts=target_counts,
         eps=eps,
     )
-    return zinb_nll[attn_mask].mean()
+    valid = zinb_nll[attn_mask]
+    if valid.numel() == 0:
+        return torch.tensor(0.0, device=zinb_nll.device)
+    return valid.mean()
 
 
 # -----------------------------------------------------------------------------
@@ -809,9 +823,9 @@ if use_cuda:
 torch.set_float32_matmul_precision("high")
 print(f"Token model device: {device}")
 
-BATCH_SIZE_CUDA = 128
-BATCH_SIZE_CPU = 32
-NUM_WORKERS = 2 if use_cuda else 0
+BATCH_SIZE_CUDA = 256
+BATCH_SIZE_CPU = 64
+NUM_WORKERS = 6 if use_cuda else 0
 
 batch_size = BATCH_SIZE_CUDA if use_cuda else BATCH_SIZE_CPU
 loader_kwargs = {
@@ -851,15 +865,15 @@ def run_epoch_token_ae(
     loader,
     optimizer,
     device,
-    scaler,
     train=True,
     epoch_label="",
-    log_every=200,
+    log_every=1000,
 ):
     model.train() if train else model.eval()
 
     loss_sum = 0.0
     n_batches = 0
+    n_skipped = 0
     stage = "train" if train else "val"
     total_batches = len(loader)
     t0 = time.time()
@@ -872,7 +886,7 @@ def run_epoch_token_ae(
         unit="batch",
         leave=False,
         dynamic_ncols=True,
-        mininterval=0.5,
+        mininterval=2.0,
         file=sys.stdout,
     )
 
@@ -887,35 +901,61 @@ def run_epoch_token_ae(
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train):
-            with torch.amp.autocast("cuda", enabled=use_cuda):
-                _, _, mu_logit, pi_logit, theta_unconstrained = model.forward_with_params(
-                    gene_ids=gene_ids,
-                    x_vals=x_vals,
-                    attn_mask=attn_mask,
-                    tissue_id=tissue_id,
-                )
-                loss = token_zinb_loss(mu_logit, pi_logit, theta_unconstrained, y_vals, attn_mask)
+            _, _, mu_logit, pi_logit, theta_unconstrained = model.forward_with_params(
+                gene_ids=gene_ids,
+                x_vals=x_vals,
+                attn_mask=attn_mask,
+                tissue_id=tissue_id,
+            )
+
+            if not torch.isfinite(mu_logit).all():
+                print(f"{epoch_label} [{stage}] skipped batch: non-finite mu_logit")
+                n_skipped += 1
+                continue
+            if not torch.isfinite(pi_logit).all():
+                print(f"{epoch_label} [{stage}] skipped batch: non-finite pi_logit")
+                n_skipped += 1
+                continue
+            if not torch.isfinite(theta_unconstrained).all():
+                print(f"{epoch_label} [{stage}] skipped batch: non-finite theta")
+                n_skipped += 1
+                continue
+
+            loss = token_zinb_loss(
+                mu_logit=mu_logit,
+                pi_logit=pi_logit,
+                theta_unconstrained=theta_unconstrained,
+                target_counts=y_vals,
+                attn_mask=attn_mask,
+            )
+
+            if not torch.isfinite(loss):
+                print(f"{epoch_label} [{stage}] skipped batch: non-finite loss")
+                n_skipped += 1
+                continue
 
             if train:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
 
         loss_sum += float(loss.item())
         n_batches += 1
 
         if n_batches % log_every == 0 or n_batches == total_batches:
-            avg_loss = loss_sum / n_batches
+            avg_loss = loss_sum / max(n_batches, 1)
             elapsed = time.time() - t0
             print(
                 f"{epoch_label} [{stage}] {n_batches}/{total_batches} "
-                f"avg_zinb_nll={avg_loss:.5f} elapsed={elapsed/60:.1f}m"
+                f"avg_zinb_nll={avg_loss:.5f} skipped={n_skipped} elapsed={elapsed/60:.1f}m"
             )
-            iter_loader.set_postfix({"zinb_nll": f"{avg_loss:.5f}"})
+            iter_loader.set_postfix({"zinb_nll": f"{avg_loss:.5f}", "skipped": n_skipped})
 
-    return loss_sum / max(n_batches, 1)
+    if n_batches == 0:
+        return np.inf
+
+    print(f"{epoch_label} [{stage}] done | used_batches={n_batches} skipped_batches={n_skipped}")
+    return loss_sum / n_batches
 
 
 def collect_eval_rows(model, loader, device):
@@ -992,12 +1032,11 @@ model = GeneTokenAutoencoder(
     theta_init=10.0,
 ).to(device)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 EPOCHS_TOK = 30
 PATIENCE_TOK = 5
-MIN_EPOCHS_BEFORE_EARLY_STOP = 30
+MIN_EPOCHS_BEFORE_EARLY_STOP = 20
 
 hist_train = []
 hist_val = []
@@ -1019,25 +1058,23 @@ epoch_bar = tqdm(
 
 for epoch in epoch_bar:
     tr = run_epoch_token_ae(
-        model=model,
-        loader=train_loader,
-        optimizer=optimizer,
-        device=device,
-        scaler=scaler,
-        train=True,
-        epoch_label=f"Epoch {epoch:02d}/{EPOCHS_TOK}",
-        log_every=300,
-    )
-    va = run_epoch_token_ae(
-        model=model,
-        loader=val_loader,
-        optimizer=optimizer,
-        device=device,
-        scaler=scaler,
-        train=False,
-        epoch_label=f"Epoch {epoch:02d}/{EPOCHS_TOK}",
-        log_every=300,
-    )
+    model=model,
+    loader=train_loader,
+    optimizer=optimizer,
+    device=device,
+    train=True,
+    epoch_label=f"Epoch {epoch:02d}/{EPOCHS_TOK}",
+    log_every=1000,
+)
+va = run_epoch_token_ae(
+    model=model,
+    loader=val_loader,
+    optimizer=optimizer,
+    device=device,
+    train=False,
+    epoch_label=f"Epoch {epoch:02d}/{EPOCHS_TOK}",
+    log_every=1000,
+)
 
     hist_train.append(tr)
     hist_val.append(va)

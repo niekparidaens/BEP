@@ -1034,9 +1034,9 @@ model = GeneTokenAutoencoder(
 
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-EPOCHS_TOK = 30
-PATIENCE_TOK = 5
-MIN_EPOCHS_BEFORE_EARLY_STOP = 20
+EPOCHS_TOK = 25
+PATIENCE_TOK = 3
+MIN_EPOCHS_BEFORE_EARLY_STOP = 15
 
 hist_train = []
 hist_val = []

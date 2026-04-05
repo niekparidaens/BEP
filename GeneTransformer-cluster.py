@@ -122,7 +122,7 @@ base_seed = 42
 # Helpers
 # -----------------------------------------------------------------------------
 
-def _adata_path(sample_id: str) -> Path:
+def _adata_path(sample_id: str):
     return ANN_DIR / f"{sample_id}_xenium_cell_level.h5ad"
 
 
@@ -1021,7 +1021,7 @@ def collect_eval_rows(model, loader, device):
 # Train
 # -----------------------------------------------------------------------------
 
-model = GeneTokenAutoencoder(
+model = GeneTokenAutoencoder(+
     n_genes_vocab=len(gene2id),
     n_tissues=len(tissue2id),
     d_model=128,

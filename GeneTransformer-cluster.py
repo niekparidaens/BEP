@@ -44,7 +44,6 @@ train = {
         ],
         "panel_2": ["NCBI783", "TENX94", "TENX95", "TENX98", "TENX99"],
     },
-    "Cervix": {"panel_1": ["TENX188"]},
     "Femur bone": {"panel_1": ["TENX132"]},
     "Heart": {"panel_1": ["TENX119"]},
     "Kidney": {"panel_1": ["TENX105", "TENX106"]},
@@ -55,12 +54,9 @@ train = {
             "NCBI864", "NCBI865", "NCBI866", "NCBI867", "NCBI870",
             "NCBI873", "NCBI875", "NCBI876", "NCBI879", "NCBI880"
         ],
-        "panel_2": ["NCBI887", "NCBI888", "TENX189"],
-        "panel_3": ["NCBI885", "NCBI886"],
+        "panel_2": ["NCBI885", "NCBI886"],
     },
-    "Lymph node (Left Axilla)": {"panel_1": ["TENX143"]},
-    "Ovary": {"panel_1": ["TENX142"], "panel_2": ["TENX187"]},
-    "Prostate": {"panel_1": ["TENX157"]},
+    "Ovary": {"panel_1": ["TENX142"]},
     "Tonsil": {"panel_1": ["TENX124", "TENX125"]},
 }
 
@@ -77,7 +73,6 @@ val = {
             "panel_1": ["TENX122", "TENX123"],
             "panel_2": ["TENX115"],
             "panel_3": ["TENX117"],
-            "panel_4": ["TENX158"],
         },
     },
 }
@@ -418,13 +413,6 @@ for sid in TRAIN_SAMPLE_IDS[1:]:
 train_tissue_names = sorted({panel_to_tissue[sid] for sid in TRAIN_SAMPLE_IDS})
 tissue_names = sorted(set(train_tissue_names) | {UNKNOWN_TISSUE_TOKEN})
 tissue2id = {t: i for i, t in enumerate(tissue_names)}
-
-missing_p_tissues = sorted((set(train_tissue_names) - set(P_BY_TISSUE.keys())))
-if missing_p_tissues:
-    print(
-        "Using DEFAULT_CORRUPTION_P for tissues without explicit P_BY_TISSUE entries:",
-        missing_p_tissues,
-    )
 
 print(f"Train samples: {len(TRAIN_SAMPLE_IDS)}")
 print(f"Val samples: {len(VAL_SAMPLE_IDS)}")

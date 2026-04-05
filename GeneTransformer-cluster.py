@@ -122,11 +122,11 @@ base_seed = 42
 # Helpers
 # -----------------------------------------------------------------------------
 
-def _adata_path(sample_id: str):
+def _adata_path(sample_id):
     return ANN_DIR / f"{sample_id}_xenium_cell_level.h5ad"
 
 
-def _load_sample_backed(sample_id: str, read_mode: str = READ_MODE):
+def _load_sample_backed(sample_id, read_mode=READ_MODE):
     h5ad_path = _adata_path(sample_id)
     if not h5ad_path.exists():
         raise FileNotFoundError(f"Missing h5ad for {sample_id}: {h5ad_path}")

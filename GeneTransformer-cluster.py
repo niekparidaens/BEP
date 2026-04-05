@@ -1093,7 +1093,6 @@ print(f"Epoch {epoch:02d} | train={tr:.6f} | val={va:.6f}")
 
 if epoch >= MIN_EPOCHS_BEFORE_EARLY_STOP and stale >= PATIENCE_TOK:
     print(f"Early stopping at epoch {epoch}; best epoch={best_epoch}")
-    break
 
 epoch_bar.close()
 

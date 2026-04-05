@@ -538,7 +538,7 @@ train_dataset = MultiVersionTrainDataset(
 val_dataset = CorruptedEvalDataset(
     clean_matrix=Y_val,
     p_non_overlap_values=p_non_overlap_values,
-    base_seed=10_000,
+    base_seed=base_seed,
 )
 
 # Keep test lazy because it is very large

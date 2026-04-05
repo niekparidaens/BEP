@@ -423,21 +423,49 @@ class MultiVersionTrainDataset(Dataset):
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
-class CleanEvalDataset(Dataset):
-    """Validation dataset with clean inputs and clean targets (no corruption)."""
+class CorruptedEvalDataset(Dataset):
+    """Validation dataset with deterministic corruptions for all p-values."""
 
-    def __init__(self, clean_matrix):
+    def __init__(self, clean_matrix, p_non_overlap_values, base_seed=10_000):
         self.Y = np.ascontiguousarray(clean_matrix, dtype=np.float32)
         self.n_cells, self.n_genes = self.Y.shape
+        self.base_seed = int(base_seed)
+
+        self.p_values = np.atleast_1d(np.asarray(p_non_overlap_values, dtype=np.float64))
+        if self.p_values.size < 1:
+            raise ValueError("p_non_overlap_values must contain at least one value.")
+        if np.any((self.p_values < 0.0) | (self.p_values > 1.0)):
+            raise ValueError("All p_non_overlap_values must be between 0 and 1.")
+
+        self.n_versions = int(self.p_values.size)
+        self.p_versions = []
+        for p_non_overlap in self.p_values:
+            p_rep = np.full(self.n_genes, float(p_non_overlap), dtype=np.float32)
+            self.p_versions.append(p_rep)
 
     def __len__(self):
-        return self.n_cells
+        return self.n_versions * self.n_cells
 
     def __getitem__(self, idx):
-        y = self.Y[idx].copy()
-        x = y.copy()
-        return torch.from_numpy(x), torch.from_numpy(y)
+        version_idx = idx // self.n_cells
+        within_idx = idx % self.n_cells
 
+        y = self.Y[within_idx].copy()
+        x = y.copy()
+
+        nz = x > 0
+        if np.any(nz):
+            counts = np.rint(x[nz]).astype(np.int64, copy=False)
+            counts = np.clip(counts, 0, None)
+
+            # deterministic corruption per (version, cell)
+            rng = np.random.default_rng(
+                self.base_seed + version_idx * 1_000_003 + within_idx
+            )
+            p_entry = self.p_versions[version_idx][nz]
+            x[nz] = rng.binomial(counts, p_entry).astype(np.float32, copy=False)
+
+        return torch.from_numpy(x), torch.from_numpy(y)
 
 class CleanEvalDatasetLazy(Dataset):
     """Lazy test dataset with clean inputs and clean targets (no corruption)."""
@@ -507,8 +535,10 @@ train_dataset = MultiVersionTrainDataset(
     base_seed=base_seed,
 )
 
-val_dataset = CleanEvalDataset(
+val_dataset = CorruptedEvalDataset(
     clean_matrix=Y_val,
+    p_non_overlap_values=p_non_overlap_values,
+    base_seed=10_000,
 )
 
 # Keep test lazy because it is very large

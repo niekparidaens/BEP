@@ -26,13 +26,12 @@ matplotlib.use("Agg")
 
 
 # Paths / I/O
-
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/tudelft.net/staff-umbrella/Xeniumenhancer")).resolve()
 ANN_DIR = Path(os.environ.get("ANN_DIR", PROJECT_ROOT / "AnnData")).resolve()
 SAVE_DIR = Path(os.environ.get("OUTPUT_DIR", PROJECT_ROOT / "outputs")).resolve()
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Default to backed mode on the cluster so X stays on disk
+# Default to backed mode on the cluster so X stays on disk, otherwise we get RAM issues
 READ_MODE = os.environ.get("READ_MODE", "r") or "r"
 
 
@@ -49,7 +48,8 @@ def _load_sample_backed(sample_id: str, read_mode=READ_MODE):
 # Fixed split definitions / corruption setup
 threshold = 40
 genes_threshold = 5
-p_non_overlap_values = [0.15, 0.19, 0.23, 0.27, 0.31, 0.37]
+
+p_non_overlap_values = [0.19]
 base_seed = 42
 
 split_samples_train = [
@@ -86,7 +86,6 @@ def _select_available_ids(sample_ids, available_like):
 
 
 # Backed QC / metadata prep
-
 def _compute_qc_chunked(adata_backed, chunk_size=4096):
     """
     Compute total_counts and n_genes_by_counts without loading the whole matrix.
@@ -150,8 +149,6 @@ def _prepare_panel_metadata(sample_id: str, threshold: int, genes_threshold: int
         "n_obs_raw": int(ad_panel.n_obs),
         "n_obs_filtered": int(cell_pos.size),
     }
-
-
 
 # Load only requested samples
 available_ids = sorted(
@@ -239,9 +236,9 @@ class PanelRowAccessor:
     """Access rows from multiple backed AnnData panels in one shared gene order."""
 
     def __init__(self, panel_data, panel_ids, common_genes):
-        self.panel_defs = []
-        self.panel_sizes = []
-        self.common_genes = pd.Index(common_genes).astype(str)
+        self.panel_defs = [] # entries per panel containing the info for fetching rows
+        self.panel_sizes = [] # number of rows (kept cells) per panel
+        self.common_genes = pd.Index(common_genes).astype(str) # shared gene sapce
 
         for sid in panel_ids:
             rec = panel_data[sid]

@@ -1021,7 +1021,7 @@ def collect_eval_rows(model, loader, device):
 # Train
 # -----------------------------------------------------------------------------
 
-model = GeneTokenAutoencoder(+
+model = GeneTokenAutoencoder(
     n_genes_vocab=len(gene2id),
     n_tissues=len(tissue2id),
     d_model=128,
@@ -1076,24 +1076,24 @@ va = run_epoch_token_ae(
     log_every=1000,
 )
 
-    hist_train.append(tr)
-    hist_val.append(va)
+hist_train.append(tr)
+hist_val.append(va)
 
-    improved = va < (best_val - 1e-8)
-    if improved:
-        best_val = va
-        best_epoch = epoch
-        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        stale = 0
-    else:
-        stale += 1
+improved = va < (best_val - 1e-8)
+if improved:
+    best_val = va
+    best_epoch = epoch
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    stale = 0
+else:
+    stale += 1
 
-    epoch_bar.set_postfix({"train_nll": f"{tr:.5f}", "val_nll": f"{va:.5f}", "best_epoch": best_epoch})
-    print(f"Epoch {epoch:02d} | train={tr:.6f} | val={va:.6f}")
+epoch_bar.set_postfix({"train_nll": f"{tr:.5f}", "val_nll": f"{va:.5f}", "best_epoch": best_epoch})
+print(f"Epoch {epoch:02d} | train={tr:.6f} | val={va:.6f}")
 
-    if epoch >= MIN_EPOCHS_BEFORE_EARLY_STOP and stale >= PATIENCE_TOK:
-        print(f"Early stopping at epoch {epoch}; best epoch={best_epoch}")
-        break
+if epoch >= MIN_EPOCHS_BEFORE_EARLY_STOP and stale >= PATIENCE_TOK:
+    print(f"Early stopping at epoch {epoch}; best epoch={best_epoch}")
+    break
 
 epoch_bar.close()
 

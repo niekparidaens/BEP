@@ -872,6 +872,8 @@ def main():
     test_c_panel_ids, _ = _select_available_ids(split_samples_test_c, available_set)
 
     requested_ids = sorted(set(train_panel_ids + val_panel_ids + test_panel_ids))
+    requested_ids.append("TENX189") 
+    requested_ids.append("TENX190") 
     panel_data = {}
     load_failed = []
 

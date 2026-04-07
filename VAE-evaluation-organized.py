@@ -431,10 +431,6 @@ def compute_gene_mean_streaming(panel_data, panel_ids, common_genes, chunk_size)
 
 
 def materialize_panel_in_gene_space(panel_data, sample_id, common_genes, chunk_size=4096):
-    """
-    For the strict pair plots we do want the full panel in one matrix.
-    This is only for a single sample, so it is still manageable.
-    """
     accessor = PanelRowAccessor(panel_data, [sample_id], common_genes)
     rec = panel_data[sample_id]
 
@@ -451,12 +447,26 @@ def materialize_panel_in_gene_space(panel_data, sample_id, common_genes, chunk_s
         X[write_pos:write_pos + n_block] = block
         write_pos += n_block
 
-    obs = rec["adata"].obs.iloc[rec["cell_pos"]].copy()
-    obs_names = pd.Index(rec["adata"].obs_names.astype(str))[rec["cell_pos"]].copy()
+    ad_src = rec["adata"]
+    kept_rows = rec["cell_pos"]
+
+    obs = ad_src.obs.iloc[kept_rows].copy()
+    obs_names = pd.Index(ad_src.obs_names.astype(str))[kept_rows].copy()
     var = pd.DataFrame(index=pd.Index(common_genes).astype(str))
 
     adata_out = ad.AnnData(X=X, obs=obs, var=var)
     adata_out.obs_names = obs_names
+
+    # Copy obsm entries when present
+    for key in ad_src.obsm.keys():
+        try:
+            adata_out.obsm[key] = np.asarray(ad_src.obsm[key])[kept_rows].copy()
+        except Exception:
+            pass
+
+    # Rebuild adata.obsm["spatial"] from obs columns if needed
+    _ensure_spatial_coords(adata_out)
+
     return adata_out
 
 
@@ -707,6 +717,31 @@ def _find_spatial_xy(adata_obj):
 
     return None, None, None
 
+def _ensure_spatial_coords(adata):
+    if "spatial" in adata.obsm:
+        return
+
+    candidate_pairs = [
+        ("nucleus_centroid_x", "nucleus_centroid_y"),
+        ("x_centroid", "y_centroid"),
+        ("x", "y"),
+        ("center_x", "center_y"),
+        ("centroid_x", "centroid_y"),
+        ("global_x", "global_y"),
+    ]
+
+    pair = next(
+        ((x, y) for x, y in candidate_pairs if x in adata.obs.columns and y in adata.obs.columns),
+        None,
+    )
+
+    if pair is None:
+        raise KeyError(
+            "No spatial coordinates found. Expected adata.obsm['spatial'] or one of: "
+            f"{candidate_pairs}."
+        )
+
+    adata.obsm["spatial"] = adata.obs[[pair[0], pair[1]]].to_numpy()
 
 def zinb_expected_counts_batched(model, X_in, logit_pi, device, batch_size=1024):
     """

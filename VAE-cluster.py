@@ -59,19 +59,16 @@ split_samples_train = [
 split_samples_val = ["NCBI879", "NCBI880", "NCBI881"]
 split_samples_test_a = ["NCBI882", "NCBI883", "NCBI884"]
 split_samples_test_b = [
-    "NCBI887", "NCBI888", "TENX189",
-    "NCBI885", "NCBI886",
-    "NCBI859",
-    "TENX118",
-    "TENX141",
-    "TENX190",
+    "NCBI887", "NCBI888", "TENX189", # panel
+    # "NCBI885", "NCBI886", # panel
+    #"NCBI859", # panel
+    # "TENX118", # panel
+    # "TENX141", # panel
+    # "TENX190", # panel
 ]
 split_samples_test_c = [
-    "TENX191", "TENX192", "TENX193", "TENX194", "TENX195", "TENX196", "TENX197", "TENX198",
-    "NCBI783", "TENX94", "TENX95", "TENX98", "TENX99",
-    "TENX147", "TENX148", "TENX149", "TENX111", "TENX114",
-    "TENX116", "TENX126", "TENX140",
-    "TENX122", "TENX123", "TENX115", "TENX117", "TENX158",
+    "TENX191", "TENX192", "TENX193", "TENX194",
+    "TENX195", "TENX196", "TENX197", "TENX198"
 ]
 split_samples_test = split_samples_test_a + split_samples_test_b + split_samples_test_c
 
@@ -247,7 +244,7 @@ class PanelRowAccessor:
             idx = rec["gene_names"].get_indexer(self.common_genes)
             present_mask = idx >= 0
 
-            # Positions in the panel's filtered gene list
+            # Positions in the panel's filtered gene list for the genes that exist
             filtered_pos = idx[present_mask].astype(np.int64, copy=False)
 
             # Convert to original X column positions
@@ -276,6 +273,7 @@ class PanelRowAccessor:
         self.total_cells = int(self.cum_sizes[-1]) if self.cum_sizes.size else 0
         self.n_genes = int(len(self.common_genes))
 
+    # Locates the panel and within-panel row for a global cell index
     def _locate(self, global_cell_idx):
         if global_cell_idx < 0 or global_cell_idx >= self.total_cells:
             raise IndexError("Cell index out of range.")
@@ -284,6 +282,7 @@ class PanelRowAccessor:
         within_panel_idx = int(global_cell_idx - prev_cum)
         return panel_idx, within_panel_idx
 
+    # Fetches the single row as a dense vector (in the shared gene space)
     def get_row_dense(self, global_cell_idx):
         panel_idx, row_idx = self._locate(global_cell_idx)
         ad_panel, cell_pos, panel_pos, common_pos = self.panel_defs[panel_idx]
@@ -359,7 +358,7 @@ def load_or_build_dense_split(
                 else:
                     block = np.asarray(block)
             except Exception:
-                # Fallback: row-by-row if backed fancy indexing fails
+                # row-by-row if backed fancy indexing fails
                 block_rows = []
                 for r in rows:
                     row = ad_panel.X[int(r), panel_pos]
@@ -372,6 +371,7 @@ def load_or_build_dense_split(
 
             block = block.astype(dtype, copy=False)
 
+            # Map to shared gene space
             Y_block = np.zeros((block.shape[0], accessor.n_genes), dtype=dtype)
             Y_block[:, common_pos] = block
 
@@ -390,6 +390,7 @@ class MultiVersionTrainDataset(Dataset):
         self.n_train, self.n_genes = self.Y.shape
         self.base_seed = int(base_seed)
 
+        # sanity checks for the p values
         self.p_values = np.atleast_1d(np.asarray(p_non_overlap_values, dtype=np.float64))
         if self.p_values.size < 1:
             raise ValueError("p_non_overlap_values must contain at least one value.")
@@ -398,6 +399,8 @@ class MultiVersionTrainDataset(Dataset):
 
         self.n_versions = int(self.p_values.size)
         self.p_versions = []
+
+        # We create a separate full-length p vector for each version of p
         for p_non_overlap in self.p_values:
             p_rep = np.full(self.n_genes, float(p_non_overlap), dtype=np.float32)
             self.p_versions.append(p_rep)
@@ -406,6 +409,7 @@ class MultiVersionTrainDataset(Dataset):
         return self.n_versions * self.n_train
 
     def __getitem__(self, idx):
+        # Determine which version and which cell within that specific version to get
         version_idx = idx // self.n_train
         within_idx = idx % self.n_train
 
@@ -467,19 +471,48 @@ class CorruptedEvalDataset(Dataset):
 
         return torch.from_numpy(x), torch.from_numpy(y)
 
-class CleanEvalDatasetLazy(Dataset):
-    """Lazy test dataset with clean inputs and clean targets (no corruption)."""
+class CorruptedTestDatasetLazy(Dataset):
+    """Lazy evaluation dataset with deterministic corruptions for all p-values."""
 
-    def __init__(self, panel_data, panel_ids, common_genes):
+    def __init__(self, panel_data, panel_ids, common_genes, p_non_overlap_values, base_seed=42):
         self.rows = PanelRowAccessor(panel_data, panel_ids, common_genes)
         self.n_cells = self.rows.total_cells
+        self.n_genes = self.rows.n_genes
+        self.base_seed = int(base_seed)
+
+        self.p_values = np.atleast_1d(np.asarray(p_non_overlap_values, dtype=np.float64))
+        if self.p_values.size < 1:
+            raise ValueError("p_non_overlap_values must contain at least one value.")
+        if np.any((self.p_values < 0.0) | (self.p_values > 1.0)):
+            raise ValueError("All p_non_overlap_values must be between 0 and 1.")
+
+        self.n_versions = int(self.p_values.size)
+        self.p_versions = []
+        for p_non_overlap in self.p_values:
+            p_rep = np.full(self.n_genes, float(p_non_overlap), dtype=np.float32)
+            self.p_versions.append(p_rep)
 
     def __len__(self):
-        return self.n_cells
+        return self.n_versions * self.n_cells
 
     def __getitem__(self, idx):
-        y = self.rows.get_row_dense(idx)
+        version_idx = idx // self.n_cells
+        within_idx = idx % self.n_cells
+
+        y = self.rows.get_row_dense(within_idx)
         x = y.copy()
+
+        nz = x > 0
+        if np.any(nz):
+            counts = np.rint(x[nz]).astype(np.int64, copy=False)
+            counts = np.clip(counts, 0, None)
+
+            rng = np.random.default_rng(
+                self.base_seed + version_idx * 1_000_003 + within_idx
+            )
+            p_entry = self.p_versions[version_idx][nz]
+            x[nz] = rng.binomial(counts, p_entry).astype(np.float32, copy=False)
+
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
@@ -521,13 +554,6 @@ Y_val = load_or_build_dense_split(
     chunk_size=2048,
 )
 
-# Compatibility placeholders
-X_inputs_model = [None] * len(p_non_overlap_values)
-X_inputs = X_inputs_model
-X_tgt = None
-Y_test = None
-
-
 
 train_dataset = MultiVersionTrainDataset(
     clean_matrix=Y_train,
@@ -542,24 +568,30 @@ val_dataset = CorruptedEvalDataset(
 )
 
 # Keep test lazy because it is very large
-test_dataset = CleanEvalDatasetLazy(
+test_dataset = CorruptedTestDatasetLazy(
     panel_data=panel_data,
     panel_ids=test_panel_ids,
     common_genes=common_genes,
+    p_non_overlap_values=p_non_overlap_values,
+    base_seed=base_seed,
 )
 
+# Number of cells in each split (after filtering)
 train_idx = np.arange(train_dataset.n_train, dtype=np.int64)
 val_idx = np.arange(len(val_dataset), dtype=np.int64)
 test_idx = np.arange(len(test_dataset), dtype=np.int64)
 
+# Number of cells in each subset
 test_a_cells = int(sum(panel_data[sid]["n_obs_filtered"] for sid in test_a_panel_ids))
 test_b_cells = int(sum(panel_data[sid]["n_obs_filtered"] for sid in test_b_panel_ids))
 test_c_cells = int(sum(panel_data[sid]["n_obs_filtered"] for sid in test_c_panel_ids))
 
+# Overall info about the splits and data setup
 n_cells = len(train_idx)
 input_name = f"panel-wise cached train/val corruptions ({len(train_panel_ids)} train panels x {len(p_non_overlap_values)} p-values)"
 split_mode = "fixed panel/sample split (panel-wise)"
 
+# Printing a lot of stuff to make sure we have all the info we need and if its correct
 print(f"Using input source: {input_name}")
 print(f"Shared genes (train-defined): {n_genes}")
 print(f"Train/Val/Test panels: {len(train_panel_ids)} / {len(val_panel_ids)} / {len(test_panel_ids)}")
@@ -568,19 +600,19 @@ print(f"Training examples: {len(train_dataset)}")
 print(f"Validation examples: {len(val_dataset)} | Test examples: {len(test_dataset)}")
 print(f"Test A/B/C cells: {test_a_cells} / {test_b_cells} / {test_c_cells}")
 print("Validation inputs: deterministic corrupted versions from p_non_overlap_values")
-print("Test inputs: clean (no corruption)")
+print("Test inputs: deterministic corrupted versions from p_non_overlap_values")
 print("Training data mode: raw counts (train/val cached dense, test lazy)")
 print(f"Training examples: {len(train_dataset)}")
 print(f"Validation examples: {len(val_dataset)} | Test examples: {len(test_dataset)}")
 
 
 # Hyperparameters
-epochs = 30
+epochs = 40
 beta = 1e-3
 latent_dim = 16
 hidden_dim = 256
-learning_rate = 1e-3
-early_stop_patience = 31
+learning_rate = 5e-4
+early_stop_patience = 41
 theta_init = 10.0
 pi_init = 0.1
 
@@ -597,7 +629,7 @@ print(f"Running on device: {device}")
 
 batch_size = batch_size_cuda if use_cuda else batch_size_cpu
 loader_kwargs = {
-    "num_workers": 0,
+    "num_workers": 4 if use_cuda else 0,
     "pin_memory": use_cuda,
 }
 
@@ -948,7 +980,7 @@ plt.show()
 # Save trained ZINB VAE weights
 save_dir = SAVE_DIR
 save_dir.mkdir(parents=True, exist_ok=True)
-weights_path = save_dir / "VAE_ZINB_weights"
+weights_path = save_dir / "VAE_ZINB_weights-07-04-2026"
 
 torch.save(
     {

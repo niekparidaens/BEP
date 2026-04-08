@@ -54,7 +54,7 @@ PAIR_V1_ID = "TENX190"
 # One representative panel per split for histogram diagnostics
 SPLIT_PANEL_FOR_HIST = {
     "A": "NCBI882",
-    "B": "NCBI887",
+    "B": "NCBI885",
     "C": "TENX191",
 }
 
@@ -81,17 +81,20 @@ split_samples_train = [
 split_samples_val = ["NCBI879", "NCBI880", "NCBI881"]
 split_samples_test_a = ["NCBI882", "NCBI883", "NCBI884"]
 split_samples_test_b = [
-    "NCBI887", "NCBI888", "TENX189",
-    # "NCBI885", "NCBI886",
-    # "NCBI859",
-    # "TENX118",
-    # "TENX141",
-    # "TENX190",
+    "NCBI885", "NCBI886",
 ]
-split_samples_test_c = [
-    "TENX191", "TENX192", "TENX193", "TENX194",
-    "TENX195", "TENX196", "TENX197", "TENX198",
-]
+split_samples_test_c = ['TENX191',
+   'TENX192',
+   'TENX193',
+   'TENX194',
+   'TENX195',
+   'TENX196',
+   'TENX197',
+   'TENX198',
+   'TENX199',
+   'TENX200',
+   'TENX201',
+   'TENX202']
 split_samples_test = split_samples_test_a + split_samples_test_b + split_samples_test_c
 
 

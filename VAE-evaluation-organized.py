@@ -68,6 +68,9 @@ SINGLE_PANEL_TOP_LOW = 4
 PAIR_TOP_HIGH_GENES = 4
 PAIR_TOP_LOW_GENES = 4
 
+# Seed used for the single ZINB draw that goes into histogram plots.
+# This keeps histogram sampling reproducible across runs.
+ZINB_HIST_SAMPLE_SEED = 314159
 
 threshold = 40
 genes_threshold = 5
@@ -135,6 +138,11 @@ def autocast_context(use_cuda: bool):
     if use_cuda:
         return torch.amp.autocast(device_type="cuda", enabled=True)
     return nullcontext()
+
+
+def _stable_string_seed(text: str) -> int:
+    text = str(text)
+    return int(sum((i + 1) * ord(ch) for i, ch in enumerate(text)))
 
 
 def _compute_qc_chunked(adata_backed, chunk_size=4096):
@@ -526,6 +534,68 @@ def corrupt_batch_deterministic(x_clean, global_idx_np, version_idx, p_val, base
     return rng.binomial(counts, float(p_val)).astype(np.float32, copy=False)
 
 
+# ZINB sampling helpers
+def sample_zinb_counts_np(mu_nb, theta_vec, pi_vec, rng, eps=1e-8):
+    """
+    Sample one count from a ZINB distribution for every cell-gene entry.
+
+    Parameterization:
+    - mu_nb: NB mean, shape (n_cells, n_genes)
+    - theta_vec: NB dispersion per gene, shape (n_genes,)
+    - pi_vec: zero-inflation probability per gene, shape (n_genes,)
+
+    Sampling:
+    1. sample NB via Gamma-Poisson mixture
+    2. apply zero inflation by forcing some entries to zero
+    """
+    mu_nb = np.asarray(mu_nb, dtype=np.float32)
+    theta_vec = np.asarray(theta_vec, dtype=np.float32)
+    pi_vec = np.asarray(pi_vec, dtype=np.float32)
+
+    mu_nb = np.clip(mu_nb, 0.0, None)
+    theta_vec = np.clip(theta_vec, eps, None)
+    pi_vec = np.clip(pi_vec, 0.0, 1.0)
+
+    gamma_shape = theta_vec[None, :]
+    gamma_scale = mu_nb / theta_vec[None, :]
+
+    lam = rng.gamma(shape=gamma_shape, scale=gamma_scale).astype(np.float32, copy=False)
+    nb_sample = rng.poisson(lam).astype(np.float32, copy=False)
+
+    zero_mask = rng.random(mu_nb.shape) < pi_vec[None, :]
+    nb_sample[zero_mask] = 0.0
+
+    return nb_sample
+
+
+def zinb_sample_once_batched(model, X_in, log_theta, logit_pi, device, batch_size=1024, rng_seed=0):
+    """
+    Run the model and draw a single ZINB sample for each cell-gene entry.
+    This is used only for histogram visualization.
+    """
+    model.eval()
+    theta_vec = F.softplus(log_theta.detach()).cpu().numpy().astype(np.float32)
+    pi_vec = torch.sigmoid(logit_pi.detach()).cpu().numpy().astype(np.float32)
+
+    out_blocks = []
+    use_cuda = device.type == "cuda"
+    rng = np.random.default_rng(int(rng_seed))
+
+    with torch.inference_mode():
+        for start in tqdm(range(0, X_in.shape[0], batch_size), desc="VAE 1x ZINB sampling", unit="batch"):
+            stop = min(start + batch_size, X_in.shape[0])
+            xb = torch.from_numpy(X_in[start:stop]).to(device, non_blocking=use_cuda)
+
+            with autocast_context(use_cuda):
+                raw_recon, _, _ = model(xb)
+
+            mu_nb = F.softplus(raw_recon).float().cpu().numpy().astype(np.float32, copy=False)
+            sample_block = sample_zinb_counts_np(mu_nb=mu_nb, theta_vec=theta_vec, pi_vec=pi_vec, rng=rng)
+            out_blocks.append(sample_block)
+
+    return np.vstack(out_blocks)
+
+
 # Metrics
 def init_metric_acc():
     return {
@@ -795,7 +865,7 @@ def zinb_expected_counts_batched(model, X_in, logit_pi, device, batch_size=1024)
             with autocast_context(use_cuda):
                 raw_recon, _, _ = model(xb)
 
-            mu_nb = F.softplus(raw_recon).float().cpu().numpy().astype(np.float32)
+            mu_nb = F.softplus(raw_recon).float().cpu().numpy().astype(np.float32, copy=False)
             out_blocks.append(mu_nb * (1.0 - pi_vec[None, :]))
 
     return np.vstack(out_blocks), pi_vec
@@ -1064,7 +1134,7 @@ def run_global_test_evaluation(
                         theta_param=log_theta,
                         zi_logits=logit_pi,
                     )
-                recon_mu = F.softplus(recon).float().cpu().numpy().astype(np.float32)
+                recon_mu = F.softplus(recon).float().cpu().numpy().astype(np.float32, copy=False)
 
             recon_expected = recon_mu * (1.0 - pi_vec[None, :])
 
@@ -1224,6 +1294,7 @@ def run_single_panel_gene_distribution_analysis(
     split_name,
     gene_names,
     model,
+    log_theta,
     logit_pi,
     device,
     save_dir,
@@ -1278,13 +1349,18 @@ def run_single_panel_gene_distribution_analysis(
     print(f"Selected genes for split {split_name}, sample {sample_id}: {selected_genes}")
 
     use_cuda = device.type == "cuda"
+    theta_vec = F.softplus(log_theta.detach()).cpu().numpy().astype(np.float32)
     pi_vec = torch.sigmoid(logit_pi.detach()).cpu().numpy().astype(np.float32)
 
     corrupt_blocks = []
-    recon_blocks = []
+    recon_expected_blocks = []
+    recon_hist_sample_blocks = []
     clean_blocks = []
 
     panel_base = full_test_bases[sample_id]
+    hist_rng = np.random.default_rng(
+        int(ZINB_HIST_SAMPLE_SEED + version_idx * 100_003 + _stable_string_seed(sample_id))
+    )
 
     for payload in tqdm(
         accessor.iter_blocks(chunk_size=IO_CHUNK_SIZE),
@@ -1310,16 +1386,24 @@ def run_single_panel_gene_distribution_analysis(
             with autocast_context(use_cuda):
                 recon, _, _ = model(xb)
 
-            recon_mu = F.softplus(recon).float().cpu().numpy().astype(np.float32)
+            recon_mu = F.softplus(recon).float().cpu().numpy().astype(np.float32, copy=False)
 
         recon_expected = recon_mu * (1.0 - pi_vec[None, :])
+        recon_hist_sample = sample_zinb_counts_np(
+            mu_nb=recon_mu,
+            theta_vec=theta_vec,
+            pi_vec=pi_vec,
+            rng=hist_rng,
+        )
 
         corrupt_blocks.append(np.clip(xb_np[:, selected_idx], 0.0, None).astype(np.float32, copy=False))
-        recon_blocks.append(np.clip(recon_expected[:, selected_idx], 0.0, None).astype(np.float32, copy=False))
+        recon_expected_blocks.append(np.clip(recon_expected[:, selected_idx], 0.0, None).astype(np.float32, copy=False))
+        recon_hist_sample_blocks.append(np.clip(recon_hist_sample[:, selected_idx], 0.0, None).astype(np.float32, copy=False))
         clean_blocks.append(np.clip(yb_np[:, selected_idx], 0.0, None).astype(np.float32, copy=False))
 
     X_corrupt = np.vstack(corrupt_blocks)
-    X_recon = np.vstack(recon_blocks)
+    X_recon_expected = np.vstack(recon_expected_blocks)
+    X_recon_hist_sample = np.vstack(recon_hist_sample_blocks)
     X_clean = np.vstack(clean_blocks)
 
     p_tag = f"{p_val:.3f}".replace(".", "p")
@@ -1328,24 +1412,26 @@ def run_single_panel_gene_distribution_analysis(
         selected_genes=selected_genes,
         gene_to_idx=gene_to_idx_local,
         X_input=X_corrupt,
-        X_recon=X_recon,
+        X_recon=X_recon_hist_sample,
         X_target=X_clean,
         save_path=save_dir / f"single_panel_{split_name}_{sample_id}_gene_histograms_p_{p_tag}.png",
         label_input=f"{sample_id} corrupted",
-        label_recon=f"{sample_id} through VAE",
+        label_recon=f"{sample_id} through VAE (1x ZINB sample)",
         label_target=f"{sample_id} clean",
     )
 
+    # Keep the summary table based on expected reconstruction so the numeric summary
+    # remains stable and comparable across runs. Only the histogram uses the sampled draw.
     selected_gene_summary = pd.DataFrame({
         "gene": selected_genes,
         "split": split_name,
         "sample_id": sample_id,
         "p_non_overlap": float(p_val),
         "mean_corrupted": X_corrupt.mean(axis=0),
-        "mean_recon": X_recon.mean(axis=0),
+        "mean_recon": X_recon_expected.mean(axis=0),
         "mean_clean": X_clean.mean(axis=0),
         "detect_corrupted": (X_corrupt > 0).mean(axis=0),
-        "detect_recon": (X_recon > 0).mean(axis=0),
+        "detect_recon": (X_recon_expected > 0).mean(axis=0),
         "detect_clean": (X_clean > 0).mean(axis=0),
     })
 
@@ -1401,7 +1487,8 @@ def run_pair_analysis(
     X5k_in = np.clip(_to_dense_float32(adata_5k.X), 0.0, None)
     Xv1 = np.clip(_to_dense_float32(adata_v1.X), 0.0, None)
 
-    X5k_recon, pi_vec = zinb_expected_counts_batched(
+    # Expected decode for metrics / scatter / spatial plots
+    X5k_recon_expected, pi_vec = zinb_expected_counts_batched(
         model=model,
         X_in=X5k_in,
         logit_pi=logit_pi,
@@ -1409,8 +1496,24 @@ def run_pair_analysis(
         batch_size=PAIR_INFER_BATCH_SIZE,
     )
 
+    # Single sampled ZINB draw for histogram plots only
+    X5k_recon_sampled = zinb_sample_once_batched(
+        model=model,
+        X_in=X5k_in,
+        log_theta=log_theta,
+        logit_pi=logit_pi,
+        device=device,
+        batch_size=PAIR_INFER_BATCH_SIZE,
+        rng_seed=int(
+            ZINB_HIST_SAMPLE_SEED
+            + _stable_string_seed(PAIR_5K_ID)
+            + 1009 * _stable_string_seed(PAIR_V1_ID)
+        ),
+    )
+
     X5k_in_pair = X5k_in[:, idx_pair]
-    X5k_recon_pair = X5k_recon[:, idx_pair]
+    X5k_recon_pair = X5k_recon_expected[:, idx_pair]
+    X5k_recon_pair_hist = X5k_recon_sampled[:, idx_pair]
     Xv1_pair = Xv1[:, idx_pair]
 
     theta_vec = F.softplus(log_theta.detach()).cpu().numpy().astype(np.float32)
@@ -1521,21 +1624,23 @@ def run_pair_analysis(
 
     gene_to_idx_pair = {g: i for i, g in enumerate(common_pair_genes.astype(str))}
 
+    # Histograms now use the single sampled ZINB draw.
     plot_selected_gene_histograms(
         selected_genes=selected_genes,
         gene_to_idx=gene_to_idx_pair,
         X_input=X5k_in_pair,
-        X_recon=X5k_recon_pair,
+        X_recon=X5k_recon_pair_hist,
         X_target=Xv1_pair,
         save_path=save_dir / f"pair_gene_histograms_{PAIR_5K_ID}_to_{PAIR_V1_ID}.png",
         label_input=f"{PAIR_5K_ID} input",
-        label_recon=f"{PAIR_5K_ID} through VAE",
+        label_recon=f"{PAIR_5K_ID} through VAE (1x ZINB sample)",
         label_target=f"{PAIR_V1_ID} target",
     )
 
     adata_5k_pair = adata_5k[:, common_pair_genes].copy()
     adata_v1_pair = adata_v1[:, common_pair_genes].copy()
 
+    # Spatial plots remain based on expected reconstruction.
     plot_selected_gene_spatial_triplets(
         selected_genes=selected_genes,
         gene_to_idx=gene_to_idx_pair,
@@ -1740,6 +1845,7 @@ def main():
                 split_name=split_name,
                 gene_names=gene_names,
                 model=model,
+                log_theta=log_theta,
                 logit_pi=logit_pi,
                 device=device,
                 save_dir=SAVE_DIR,

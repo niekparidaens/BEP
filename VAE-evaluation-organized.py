@@ -23,7 +23,7 @@ ANN_DIR = Path(os.environ.get("ANN_DIR", PROJECT_ROOT / "AnnData")).resolve()
 SAVE_DIR = Path(os.environ.get("OUTPUT_DIR", PROJECT_ROOT / "outputs" / "vae_eval")).resolve()
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_WEIGHTS_PATH = PROJECT_ROOT / "outputs" / "VAE_ZINB" / "train" / "legacy_from_test_run" / "VAE_NB_weights-NB-loss"
+DEFAULT_WEIGHTS_PATH = PROJECT_ROOT / "outputs" / "VAE_ZINB" / "train" / "legacy_from_test_run" / "VAE_ZINB_weights-07-04-2026"
 WEIGHTS_PATH = Path(os.environ.get("WEIGHTS_PATH", str(DEFAULT_WEIGHTS_PATH))).resolve()
 
 # Keep backed mode on the cluster so we do not pull giant matrices into RAM by accident.
@@ -46,9 +46,22 @@ EXACT_CORRUPTION = True
 
 RUN_GLOBAL_TEST_EVAL = True
 RUN_PAIR_ANALYSIS = True
+RUN_SINGLE_PANEL_GENE_DISTRIBUTIONS = True
 
 PAIR_5K_ID = "TENX189"
 PAIR_V1_ID = "TENX190"
+
+# One representative panel per split for histogram diagnostics
+SPLIT_PANEL_FOR_HIST = {
+    "A": "NCBI882",
+    "B": "NCBI887",
+    "C": "TENX191",
+}
+
+# If None, use the first p value from QUICK_P_VALUES / FULL_P_VALUES
+SINGLE_PANEL_GENE_DIST_P = None
+SINGLE_PANEL_TOP_HIGH = 4
+SINGLE_PANEL_TOP_LOW = 4
 
 # How many genes to visualize from the pair analysis.
 # We take the highest-mean genes and the lowest positive-mean genes.
@@ -181,6 +194,21 @@ def _prepare_panel_metadata(sample_id: str, threshold: int, genes_threshold: int
         "n_obs_raw": int(ad_panel.n_obs),
         "n_obs_filtered": int(cell_pos.size),
     }
+
+
+def _panel_global_bases(panel_data, panel_ids):
+    """
+    For a concatenated list of panels, return the starting global row index per panel.
+    This lets us reproduce the same corruption seeds as in the global test evaluation.
+    """
+    bases = {}
+    offset = 0
+    for sid in panel_ids:
+        if sid not in panel_data:
+            continue
+        bases[sid] = offset
+        offset += int(panel_data[sid]["cell_pos"].size)
+    return bases
 
 
 # Model
@@ -717,6 +745,7 @@ def _find_spatial_xy(adata_obj):
 
     return None, None, None
 
+
 def _ensure_spatial_coords(adata):
     if "spatial" in adata.obsm:
         return
@@ -742,6 +771,7 @@ def _ensure_spatial_coords(adata):
         )
 
     adata.obsm["spatial"] = adata.obs[[pair[0], pair[1]]].to_numpy()
+
 
 def zinb_expected_counts_batched(model, X_in, logit_pi, device, batch_size=1024):
     """
@@ -844,6 +874,7 @@ def plot_selected_gene_histograms(
     plt.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
+
 
 def plot_selected_gene_spatial_triplets(
     selected_genes,
@@ -1162,8 +1193,6 @@ def run_global_test_evaluation(
         if df_split.empty:
             continue
 
-        # If you only evaluate one p, this becomes one simple bar chart.
-        # If you later add more p values, you still keep the CSV as the main source of truth.
         best_p = float(df_split["p_non_overlap"].iloc[0])
         df_best = df_split[df_split["p_non_overlap"] == best_p].copy()
 
@@ -1183,6 +1212,144 @@ def run_global_test_evaluation(
             ylabel="R² on counts",
             save_path=save_dir / f"eval_split_{split_name}_r2_counts.png",
         )
+
+
+def run_single_panel_gene_distribution_analysis(
+    panel_data,
+    test_panel_ids,
+    sample_id,
+    split_name,
+    gene_names,
+    model,
+    logit_pi,
+    device,
+    save_dir,
+    version_idx,
+    p_val,
+):
+    if sample_id not in panel_data:
+        print(f"Skipping split {split_name}: sample {sample_id} not present in panel_data.")
+        return
+
+    print(f"\nRunning single-panel gene distribution analysis for split {split_name}, sample {sample_id}, p={p_val:.3f}")
+
+    accessor = PanelRowAccessor(panel_data, [sample_id], gene_names)
+
+    full_test_bases = _panel_global_bases(panel_data, test_panel_ids)
+    if sample_id not in full_test_bases:
+        print(f"Skipping split {split_name}: sample {sample_id} not found in full test ordering.")
+        return
+
+    gene_sum = np.zeros(accessor.n_genes, dtype=np.float64)
+    n_cells = 0
+
+    for payload in tqdm(
+        accessor.iter_blocks(chunk_size=IO_CHUNK_SIZE),
+        desc=f"Selecting genes for {sample_id}",
+        unit="chunk",
+    ):
+        Y = payload["Y"].astype(np.float64, copy=False)
+        gene_sum += Y.sum(axis=0)
+        n_cells += Y.shape[0]
+
+    if n_cells == 0:
+        print(f"Skipping split {split_name}: sample {sample_id} has no cells.")
+        return
+
+    mean_target = gene_sum / n_cells
+
+    selected_genes = select_high_low_genes(
+        gene_names=np.asarray(gene_names, dtype=object),
+        mean_target=mean_target,
+        n_high=SINGLE_PANEL_TOP_HIGH,
+        n_low=SINGLE_PANEL_TOP_LOW,
+    )
+
+    if len(selected_genes) == 0:
+        print(f"Skipping split {split_name}: no genes selected for {sample_id}.")
+        return
+
+    selected_idx = pd.Index(gene_names).get_indexer(selected_genes)
+    gene_to_idx_local = {g: i for i, g in enumerate(selected_genes)}
+
+    print(f"Selected genes for split {split_name}, sample {sample_id}: {selected_genes}")
+
+    use_cuda = device.type == "cuda"
+    pi_vec = torch.sigmoid(logit_pi.detach()).cpu().numpy().astype(np.float32)
+
+    corrupt_blocks = []
+    recon_blocks = []
+    clean_blocks = []
+
+    panel_base = full_test_bases[sample_id]
+
+    for payload in tqdm(
+        accessor.iter_blocks(chunk_size=IO_CHUNK_SIZE),
+        desc=f"Collecting distributions for {sample_id}",
+        unit="chunk",
+    ):
+        yb_np = payload["Y"]
+        local_global_idx = payload["global_idx"]   # for this accessor, starts at 0
+        true_global_idx = local_global_idx + panel_base
+
+        xb_np = corrupt_batch_deterministic(
+            x_clean=yb_np,
+            global_idx_np=true_global_idx,
+            version_idx=version_idx,
+            p_val=float(p_val),
+            base_seed=base_seed,
+            exact=EXACT_CORRUPTION,
+        )
+
+        xb = torch.from_numpy(xb_np).to(device, non_blocking=use_cuda)
+
+        with torch.inference_mode():
+            with autocast_context(use_cuda):
+                recon, _, _ = model(xb)
+
+            recon_mu = F.softplus(recon).float().cpu().numpy().astype(np.float32)
+
+        recon_expected = recon_mu * (1.0 - pi_vec[None, :])
+
+        corrupt_blocks.append(np.clip(xb_np[:, selected_idx], 0.0, None).astype(np.float32, copy=False))
+        recon_blocks.append(np.clip(recon_expected[:, selected_idx], 0.0, None).astype(np.float32, copy=False))
+        clean_blocks.append(np.clip(yb_np[:, selected_idx], 0.0, None).astype(np.float32, copy=False))
+
+    X_corrupt = np.vstack(corrupt_blocks)
+    X_recon = np.vstack(recon_blocks)
+    X_clean = np.vstack(clean_blocks)
+
+    p_tag = f"{p_val:.3f}".replace(".", "p")
+
+    plot_selected_gene_histograms(
+        selected_genes=selected_genes,
+        gene_to_idx=gene_to_idx_local,
+        X_input=X_corrupt,
+        X_recon=X_recon,
+        X_target=X_clean,
+        save_path=save_dir / f"single_panel_{split_name}_{sample_id}_gene_histograms_p_{p_tag}.png",
+        label_input=f"{sample_id} corrupted",
+        label_recon=f"{sample_id} through VAE",
+        label_target=f"{sample_id} clean",
+    )
+
+    selected_gene_summary = pd.DataFrame({
+        "gene": selected_genes,
+        "split": split_name,
+        "sample_id": sample_id,
+        "p_non_overlap": float(p_val),
+        "mean_corrupted": X_corrupt.mean(axis=0),
+        "mean_recon": X_recon.mean(axis=0),
+        "mean_clean": X_clean.mean(axis=0),
+        "detect_corrupted": (X_corrupt > 0).mean(axis=0),
+        "detect_recon": (X_recon > 0).mean(axis=0),
+        "detect_clean": (X_clean > 0).mean(axis=0),
+    })
+
+    selected_gene_summary.to_csv(
+        save_dir / f"single_panel_{split_name}_{sample_id}_selected_gene_summary_p_{p_tag}.csv",
+        index=False,
+    )
 
 
 def run_pair_analysis(
@@ -1535,6 +1702,47 @@ def main():
             device=device,
             save_dir=SAVE_DIR,
         )
+
+    if RUN_SINGLE_PANEL_GENE_DISTRIBUTIONS:
+        eval_p_values = np.asarray(
+            QUICK_P_VALUES if QUICK_MODE else FULL_P_VALUES,
+            dtype=np.float64,
+        )
+
+        if np.any((eval_p_values < 0.0) | (eval_p_values > 1.0)):
+            raise ValueError("All evaluation p values must be between 0 and 1.")
+
+        if SINGLE_PANEL_GENE_DIST_P is None:
+            single_panel_version_idx = 0
+        else:
+            matches = np.where(np.isclose(eval_p_values, float(SINGLE_PANEL_GENE_DIST_P)))[0]
+            if matches.size == 0:
+                raise ValueError(
+                    f"SINGLE_PANEL_GENE_DIST_P={SINGLE_PANEL_GENE_DIST_P} not found in "
+                    f"{eval_p_values.tolist()}"
+                )
+            single_panel_version_idx = int(matches[0])
+
+        single_panel_p = float(eval_p_values[single_panel_version_idx])
+
+        for split_name in ["A", "B", "C"]:
+            sample_id = SPLIT_PANEL_FOR_HIST.get(split_name)
+            if sample_id is None:
+                continue
+
+            run_single_panel_gene_distribution_analysis(
+                panel_data=panel_data,
+                test_panel_ids=test_panel_ids,
+                sample_id=sample_id,
+                split_name=split_name,
+                gene_names=gene_names,
+                model=model,
+                logit_pi=logit_pi,
+                device=device,
+                save_dir=SAVE_DIR,
+                version_idx=single_panel_version_idx,
+                p_val=single_panel_p,
+            )
 
     if RUN_PAIR_ANALYSIS:
         run_pair_analysis(

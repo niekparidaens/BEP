@@ -959,3 +959,21 @@ pi_learned = torch.sigmoid(logit_pi).detach().cpu().numpy()
 print(f"Loaded best checkpoint from epoch {best_epoch} (val_total={best_val_loss:.6f})")
 print(f"Learned ZINB theta (median): {np.median(theta_learned):.4f}")
 print(f"Learned ZINB pi (median): {np.median(pi_learned):.4f}")
+
+
+# Save trained NB VAE weights
+save_dir = SAVE_DIR
+save_dir.mkdir(parents=True, exist_ok=True)
+weights_path = save_dir / "VAE_NB_weights-library-loss"
+
+torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "log_theta": log_theta.detach().cpu(),
+        "gene_names": gene_names.tolist(),
+        "best_epoch": best_epoch if "best_epoch" in globals() else None,
+        "best_val_loss": float(best_val_loss) if "best_val_loss" in globals() else None,
+    },
+    weights_path,
+)
+print(f"Saved NB VAE weights to: {weights_path}")

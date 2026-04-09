@@ -47,6 +47,7 @@ EXACT_CORRUPTION = True
 RUN_GLOBAL_TEST_EVAL = True
 RUN_PAIR_ANALYSIS = True
 RUN_SINGLE_PANEL_GENE_DISTRIBUTIONS = True
+RUN_SPLIT_PANEL_RECON_ANALYSIS = True
 
 PAIR_5K_ID = "TENX189"
 PAIR_V1_ID = "TENX190"
@@ -58,10 +59,21 @@ SPLIT_PANEL_FOR_HIST = {
     "C": "TENX191",
 }
 
+# One representative panel per split for reconstruction scatter/spatial analysis
+SPLIT_PANEL_FOR_RECON_ANALYSIS = {
+    "A": "NCBI882",
+    "B": "NCBI885",
+    "C": "TENX191",
+}
+
 # If None, use the first p value from QUICK_P_VALUES / FULL_P_VALUES
 SINGLE_PANEL_GENE_DIST_P = None
 SINGLE_PANEL_TOP_HIGH = 4
 SINGLE_PANEL_TOP_LOW = 4
+
+# Selected genes for the extra reconstruction analyses on A/B/C example panels
+RECON_PANEL_TOP_HIGH = 4
+RECON_PANEL_TOP_LOW = 4
 
 # How many genes to visualize from the pair analysis.
 # We take the highest-mean genes and the lowest positive-mean genes.
@@ -86,18 +98,20 @@ split_samples_test_a = ["NCBI882", "NCBI883", "NCBI884"]
 split_samples_test_b = [
     "NCBI885", "NCBI886",
 ]
-split_samples_test_c = ['TENX191',
-   'TENX192',
-   'TENX193',
-   'TENX194',
-   'TENX195',
-   'TENX196',
-   'TENX197',
-   'TENX198',
-   'TENX199',
-   'TENX200',
-   'TENX201',
-   'TENX202']
+split_samples_test_c = [
+    "TENX191",
+    "TENX192",
+    "TENX193",
+    "TENX194",
+    "TENX195",
+    "TENX196",
+    "TENX197",
+    "TENX198",
+    "TENX199",
+    "TENX200",
+    "TENX201",
+    "TENX202",
+]
 split_samples_test = split_samples_test_a + split_samples_test_b + split_samples_test_c
 
 
@@ -402,8 +416,10 @@ class PanelRowAccessor:
             n_rows = int(cell_pos.size)
 
             if selected_global_idx is None:
-                local_blocks = [np.arange(start, min(start + chunk_size, n_rows), dtype=np.int64)
-                                for start in range(0, n_rows, chunk_size)]
+                local_blocks = [
+                    np.arange(start, min(start + chunk_size, n_rows), dtype=np.int64)
+                    for start in range(0, n_rows, chunk_size)
+                ]
             else:
                 lo = np.searchsorted(selected_global_idx, global_offset, side="left")
                 hi = np.searchsorted(selected_global_idx, global_offset + n_rows, side="left")
@@ -496,14 +512,12 @@ def materialize_panel_in_gene_space(panel_data, sample_id, common_genes, chunk_s
     adata_out = ad.AnnData(X=X, obs=obs, var=var)
     adata_out.obs_names = obs_names
 
-    # Copy obsm entries when present
     for key in ad_src.obsm.keys():
         try:
             adata_out.obsm[key] = np.asarray(ad_src.obsm[key])[kept_rows].copy()
         except Exception:
             pass
 
-    # Rebuild adata.obsm["spatial"] from obs columns if needed
     _ensure_spatial_coords(adata_out)
 
     return adata_out
@@ -538,15 +552,6 @@ def corrupt_batch_deterministic(x_clean, global_idx_np, version_idx, p_val, base
 def sample_zinb_counts_np(mu_nb, theta_vec, pi_vec, rng, eps=1e-8):
     """
     Sample one count from a ZINB distribution for every cell-gene entry.
-
-    Parameterization:
-    - mu_nb: NB mean, shape (n_cells, n_genes)
-    - theta_vec: NB dispersion per gene, shape (n_genes,)
-    - pi_vec: zero-inflation probability per gene, shape (n_genes,)
-
-    Sampling:
-    1. sample NB via Gamma-Poisson mixture
-    2. apply zero inflation by forcing some entries to zero
     """
     mu_nb = np.asarray(mu_nb, dtype=np.float32)
     theta_vec = np.asarray(theta_vec, dtype=np.float32)
@@ -616,7 +621,6 @@ def update_metric_acc(acc, pred, true):
 
     This matters for the gene-mean baseline:
     pred may come in as shape (1, n_genes) while true is (batch, n_genes).
-    The arithmetic broadcasts fine, but metric counting needs the same broadcast too.
     """
     pred64 = np.asarray(pred, dtype=np.float64)
     true64 = np.asarray(true, dtype=np.float64)
@@ -749,7 +753,7 @@ def plot_exact_scatter_with_fit(
 
     slope, intercept = np.polyfit(x, y, 1)
     pearson_r = float(np.corrcoef(x, y)[0, 1])
-    line_max = float(max(x.max(), y.max())) * (1.0 + line_pad)
+    line_max = float(max(x.max(), y.max(), 1e-8)) * (1.0 + line_pad)
 
     line_x = np.array([0.0, line_max], dtype=np.float64)
 
@@ -791,6 +795,91 @@ def plot_exact_scatter_with_fit(
         "slope": float(slope),
         "intercept": float(intercept),
     }
+
+
+def save_reconstruction_scatter_suite(
+    mean_input,
+    mean_recon,
+    mean_target,
+    det_input,
+    det_recon,
+    det_target,
+    title_prefix,
+    input_label,
+    recon_label,
+    target_label,
+    save_path_linear,
+    save_path_log,
+):
+    fig, axes = plt.subplots(2, 2, figsize=(13, 11))
+
+    plot_exact_scatter_with_fit(
+        x=mean_target,
+        y=mean_input,
+        title=f"Gene mean: {input_label} vs {target_label}",
+        x_label=f"{target_label} gene mean",
+        y_label=f"{input_label} gene mean",
+        color="#1f77b4",
+        ax=axes[0, 0],
+    )
+    plot_exact_scatter_with_fit(
+        x=mean_target,
+        y=mean_recon,
+        title=f"Gene mean: {recon_label} vs {target_label}",
+        x_label=f"{target_label} gene mean",
+        y_label=f"{recon_label} gene mean",
+        color="#E68613",
+        ax=axes[0, 1],
+    )
+    plot_exact_scatter_with_fit(
+        x=det_target,
+        y=det_input,
+        title=f"Detection: {input_label} vs {target_label}",
+        x_label=f"{target_label} detection rate",
+        y_label=f"{input_label} detection rate",
+        color="#1f77b4",
+        ax=axes[1, 0],
+    )
+    plot_exact_scatter_with_fit(
+        x=det_target,
+        y=det_recon,
+        title=f"Detection: {recon_label} vs {target_label}",
+        x_label=f"{target_label} detection rate",
+        y_label=f"{recon_label} detection rate",
+        color="#E68613",
+        ax=axes[1, 1],
+    )
+
+    fig.suptitle(title_prefix, y=1.002)
+    plt.tight_layout()
+    fig.savefig(save_path_linear, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.5))
+
+    plot_exact_scatter_with_fit(
+        x=np.log1p(mean_target),
+        y=np.log1p(mean_input),
+        title=f"log gene mean: {input_label} vs {target_label}",
+        x_label=f"log1p({target_label} gene mean)",
+        y_label=f"log1p({input_label} gene mean)",
+        color="#1f77b4",
+        ax=axes[0],
+    )
+    plot_exact_scatter_with_fit(
+        x=np.log1p(mean_target),
+        y=np.log1p(mean_recon),
+        title=f"log gene mean: {recon_label} vs {target_label}",
+        x_label=f"log1p({target_label} gene mean)",
+        y_label=f"log1p({recon_label} gene mean)",
+        color="#E68613",
+        ax=axes[1],
+    )
+
+    fig.suptitle(f"{title_prefix} | log-scale gene means", y=1.02)
+    plt.tight_layout()
+    fig.savefig(save_path_log, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _find_spatial_xy(adata_obj):
@@ -869,6 +958,28 @@ def zinb_expected_counts_batched(model, X_in, logit_pi, device, batch_size=1024)
             out_blocks.append(mu_nb * (1.0 - pi_vec[None, :]))
 
     return np.vstack(out_blocks), pi_vec
+
+
+def expected_detection_rate_from_zinb_expected_counts(x_expected, theta_vec, pi_vec, eps=1e-8):
+    """
+    Compute expected detection rate per gene from the ZINB parameters.
+
+    x_expected is the expected count after zero inflation:
+        E[X] = (1 - pi) * mu_nb
+    """
+    x_expected = np.asarray(x_expected, dtype=np.float32)
+    theta_vec = np.asarray(theta_vec, dtype=np.float32)
+    pi_vec = np.asarray(pi_vec, dtype=np.float32)
+
+    denom = np.clip(1.0 - pi_vec[None, :], eps, None)
+    mu_nb = x_expected / denom
+
+    nb_p0 = np.power(
+        theta_vec[None, :] / (theta_vec[None, :] + np.clip(mu_nb, 0.0, None) + eps),
+        theta_vec[None, :],
+    )
+    p0 = pi_vec[None, :] + (1.0 - pi_vec[None, :]) * nb_p0
+    return (1.0 - p0).mean(axis=0)
 
 
 def select_high_low_genes(gene_names, mean_target, n_high=4, n_low=4):
@@ -959,6 +1070,8 @@ def plot_selected_gene_spatial_triplets(
     label_input="Input",
     label_recon="Reconstruction",
     label_target="Target",
+    X_input=None,
+    X_target=None,
 ):
     x_in, y_in, in_source = _find_spatial_xy(adata_input)
     x_tar, y_tar, tar_source = _find_spatial_xy(adata_target)
@@ -971,14 +1084,28 @@ def plot_selected_gene_spatial_triplets(
     if n_rows == 0:
         return
 
+    if X_input is not None:
+        X_input = np.asarray(X_input, dtype=np.float32)
+    X_recon = np.asarray(X_recon, dtype=np.float32)
+    if X_target is not None:
+        X_target = np.asarray(X_target, dtype=np.float32)
+
     fig, axes = plt.subplots(n_rows, 3, figsize=(15, 4.2 * n_rows), squeeze=False)
 
     for i, gene in enumerate(selected_genes):
         g_idx = gene_to_idx[gene]
 
-        expr_input = np.log1p(np.clip(_to_dense_float32(adata_input.X[:, g_idx]).ravel(), 0.0, None))
+        if X_input is None:
+            expr_input = np.log1p(np.clip(_to_dense_float32(adata_input.X[:, g_idx]).ravel(), 0.0, None))
+        else:
+            expr_input = np.log1p(np.clip(X_input[:, g_idx], 0.0, None))
+
         expr_recon = np.log1p(np.clip(X_recon[:, g_idx], 0.0, None))
-        expr_target = np.log1p(np.clip(_to_dense_float32(adata_target.X[:, g_idx]).ravel(), 0.0, None))
+
+        if X_target is None:
+            expr_target = np.log1p(np.clip(_to_dense_float32(adata_target.X[:, g_idx]).ravel(), 0.0, None))
+        else:
+            expr_target = np.log1p(np.clip(X_target[:, g_idx], 0.0, None))
 
         vmax = float(max(
             np.percentile(expr_input, 99) if expr_input.size else 0.0,
@@ -1082,6 +1209,12 @@ def run_global_test_evaluation(
         for split_name in ["A", "B", "C"]
         for m in METHODS
     }
+    per_panel_acc = {
+        (int(v), split_name_by_sid.get(sid), sid, m): init_metric_acc()
+        for v in range(len(eval_p_values))
+        for sid in test_panel_ids
+        for m in METHODS
+    }
 
     loss_sum_weighted = 0.0
     recon_sum_weighted = 0.0
@@ -1105,6 +1238,7 @@ def run_global_test_evaluation(
         )
 
         for payload in eval_iter:
+            sample_id = payload["sample_id"]
             global_idx_np = payload["global_idx"]
             yb_np = payload["Y"]
             split_name = payload["split"]
@@ -1159,6 +1293,10 @@ def run_global_test_evaluation(
                 update_metric_acc(per_split_acc[(version_idx, split_name, METHOD_VAE)], recon_expected, yb_np)
                 update_metric_acc(per_split_acc[(version_idx, split_name, METHOD_ID)], xb_np, yb_np)
                 update_metric_acc(per_split_acc[(version_idx, split_name, METHOD_MEAN)], gene_mean_train[None, :], yb_np)
+
+                update_metric_acc(per_panel_acc[(version_idx, split_name, sample_id, METHOD_VAE)], recon_expected, yb_np)
+                update_metric_acc(per_panel_acc[(version_idx, split_name, sample_id, METHOD_ID)], xb_np, yb_np)
+                update_metric_acc(per_panel_acc[(version_idx, split_name, sample_id, METHOD_MEAN)], gene_mean_train[None, :], yb_np)
 
     if loss_weight == 0:
         raise RuntimeError("No evaluation batches were produced.")
@@ -1286,6 +1424,66 @@ def run_global_test_evaluation(
             save_path=save_dir / f"eval_split_{split_name}_r2_counts.png",
         )
 
+    panel_rows = []
+    for version_idx, p_val in enumerate(eval_p_values):
+        for split_name in ["A", "B", "C"]:
+            split_panel_ids = [sid for sid in test_panel_ids if split_name_by_sid.get(sid) == split_name]
+            for sample_id in split_panel_ids:
+                for method_name in METHODS:
+                    out = finalize_metric_acc(per_panel_acc[(version_idx, split_name, sample_id, method_name)])
+                    if out["n_cells"] == 0:
+                        continue
+                    panel_rows.append({
+                        "p_non_overlap": float(p_val),
+                        "split": split_name,
+                        "sample_id": sample_id,
+                        "method": method_name,
+                        "n_cells": out["n_cells"],
+                        "rmse_counts": out["rmse_counts"],
+                        "r2_counts": out["r2_counts"],
+                        "rmse_log1p": out["rmse_log1p"],
+                        "r2_log1p": out["r2_log1p"],
+                        "mse_counts": out["mse_counts"],
+                        "mse_log1p": out["mse_log1p"],
+                    })
+
+    scoreboard_by_panel = (
+        pd.DataFrame(panel_rows)
+        .sort_values(["p_non_overlap", "split", "sample_id", "rmse_counts"], ascending=[True, True, True, True])
+        .reset_index(drop=True)
+    )
+    print("\nPer-panel scoreboard:")
+    print(scoreboard_by_panel.to_string(index=False))
+    scoreboard_by_panel.to_csv(save_dir / "eval_scoreboard_by_panel.csv", index=False)
+
+    panel_summary_vae = scoreboard_by_panel[scoreboard_by_panel["method"] == METHOD_VAE].copy()
+    panel_summary_vae.to_csv(save_dir / "eval_panel_summary_vae.csv", index=False)
+
+    for split_name in ["A", "B", "C"]:
+        df_panel = panel_summary_vae[panel_summary_vae["split"] == split_name].copy()
+        if df_panel.empty:
+            continue
+
+        best_p = float(df_panel["p_non_overlap"].iloc[0])
+        df_best = df_panel[df_panel["p_non_overlap"] == best_p].sort_values("rmse_counts").copy()
+
+        save_bar_plot(
+            df_best,
+            category_col="sample_id",
+            value_col="rmse_counts",
+            title=f"Split {split_name} | VAE per-panel RMSE (p={best_p:.2f})",
+            ylabel="RMSE on counts",
+            save_path=save_dir / f"eval_split_{split_name}_vae_per_panel_rmse_counts.png",
+        )
+        save_bar_plot(
+            df_best,
+            category_col="sample_id",
+            value_col="r2_counts",
+            title=f"Split {split_name} | VAE per-panel R² (p={best_p:.2f})",
+            ylabel="R² on counts",
+            save_path=save_dir / f"eval_split_{split_name}_vae_per_panel_r2_counts.png",
+        )
+
 
 def run_single_panel_gene_distribution_analysis(
     panel_data,
@@ -1368,7 +1566,7 @@ def run_single_panel_gene_distribution_analysis(
         unit="chunk",
     ):
         yb_np = payload["Y"]
-        local_global_idx = payload["global_idx"]   # for this accessor, starts at 0
+        local_global_idx = payload["global_idx"]
         true_global_idx = local_global_idx + panel_base
 
         xb_np = corrupt_batch_deterministic(
@@ -1420,8 +1618,6 @@ def run_single_panel_gene_distribution_analysis(
         label_target=f"{sample_id} clean",
     )
 
-    # Keep the summary table based on expected reconstruction so the numeric summary
-    # remains stable and comparable across runs. Only the histogram uses the sampled draw.
     selected_gene_summary = pd.DataFrame({
         "gene": selected_genes,
         "split": split_name,
@@ -1438,6 +1634,157 @@ def run_single_panel_gene_distribution_analysis(
     selected_gene_summary.to_csv(
         save_dir / f"single_panel_{split_name}_{sample_id}_selected_gene_summary_p_{p_tag}.csv",
         index=False,
+    )
+
+
+def run_split_panel_reconstruction_analysis(
+    panel_data,
+    test_panel_ids,
+    sample_id,
+    split_name,
+    gene_names,
+    model,
+    log_theta,
+    logit_pi,
+    device,
+    save_dir,
+    version_idx,
+    p_val,
+):
+    if sample_id not in panel_data:
+        print(f"Skipping reconstruction analysis for split {split_name}: sample {sample_id} not present in panel_data.")
+        return
+
+    full_test_bases = _panel_global_bases(panel_data, test_panel_ids)
+    if sample_id not in full_test_bases:
+        print(f"Skipping reconstruction analysis for split {split_name}: sample {sample_id} not found in full test ordering.")
+        return
+
+    print(f"\nRunning reconstruction analysis for split {split_name}, sample {sample_id}, p={p_val:.3f}")
+
+    adata_clean = materialize_panel_in_gene_space(
+        panel_data=panel_data,
+        sample_id=sample_id,
+        common_genes=gene_names,
+        chunk_size=IO_CHUNK_SIZE,
+    )
+
+    X_clean = np.clip(_to_dense_float32(adata_clean.X), 0.0, None)
+    if X_clean.shape[0] == 0:
+        print(f"Skipping reconstruction analysis for split {split_name}: sample {sample_id} has no cells.")
+        return
+
+    panel_base = full_test_bases[sample_id]
+    global_idx_np = panel_base + np.arange(X_clean.shape[0], dtype=np.int64)
+
+    X_corrupt = corrupt_batch_deterministic(
+        x_clean=X_clean,
+        global_idx_np=global_idx_np,
+        version_idx=version_idx,
+        p_val=float(p_val),
+        base_seed=base_seed,
+        exact=EXACT_CORRUPTION,
+    )
+
+    X_recon_expected, pi_vec = zinb_expected_counts_batched(
+        model=model,
+        X_in=X_corrupt,
+        logit_pi=logit_pi,
+        device=device,
+        batch_size=PAIR_INFER_BATCH_SIZE,
+    )
+
+    theta_vec = F.softplus(log_theta.detach()).cpu().numpy().astype(np.float32)
+
+    mean_input = X_corrupt.mean(axis=0)
+    mean_recon = X_recon_expected.mean(axis=0)
+    mean_target = X_clean.mean(axis=0)
+
+    det_input = (X_corrupt > 0).mean(axis=0)
+    det_target = (X_clean > 0).mean(axis=0)
+    det_recon = expected_detection_rate_from_zinb_expected_counts(X_recon_expected, theta_vec, pi_vec)
+
+    rmse_mean_input, r2_mean_input = rmse_and_r2(mean_input, mean_target)
+    rmse_mean_recon, r2_mean_recon = rmse_and_r2(mean_recon, mean_target)
+    rmse_det_input, r2_det_input = rmse_and_r2(det_input, det_target)
+    rmse_det_recon, r2_det_recon = rmse_and_r2(det_recon, det_target)
+
+    p_tag = f"{p_val:.3f}".replace(".", "p")
+
+    recon_summary = pd.DataFrame([
+        {"comparison": "corrupted_vs_clean_gene_mean", "rmse": rmse_mean_input, "r2": r2_mean_input},
+        {"comparison": "recon_vs_clean_gene_mean", "rmse": rmse_mean_recon, "r2": r2_mean_recon},
+        {"comparison": "corrupted_vs_clean_detection", "rmse": rmse_det_input, "r2": r2_det_input},
+        {"comparison": "recon_vs_clean_detection", "rmse": rmse_det_recon, "r2": r2_det_recon},
+    ])
+    print("\nSplit-panel reconstruction summary:")
+    print(recon_summary.to_string(index=False))
+    recon_summary.to_csv(
+        save_dir / f"split_panel_summary_{split_name}_{sample_id}_p_{p_tag}.csv",
+        index=False,
+    )
+
+    gene_summary = pd.DataFrame({
+        "gene": pd.Index(gene_names).astype(str),
+        "mean_corrupted": mean_input,
+        "mean_recon": mean_recon,
+        "mean_clean": mean_target,
+        "detect_corrupted": det_input,
+        "detect_recon": det_recon,
+        "detect_clean": det_target,
+        "abs_err_mean_corrupted_vs_clean": np.abs(mean_input - mean_target),
+        "abs_err_mean_recon_vs_clean": np.abs(mean_recon - mean_target),
+    }).sort_values("mean_clean", ascending=False).reset_index(drop=True)
+    gene_summary.to_csv(
+        save_dir / f"split_panel_gene_summary_{split_name}_{sample_id}_p_{p_tag}.csv",
+        index=False,
+    )
+
+    save_reconstruction_scatter_suite(
+        mean_input=mean_input,
+        mean_recon=mean_recon,
+        mean_target=mean_target,
+        det_input=det_input,
+        det_recon=det_recon,
+        det_target=det_target,
+        title_prefix=f"Split {split_name}: {sample_id} corrupted -> VAE -> clean",
+        input_label=f"{sample_id} corrupted",
+        recon_label="Reconstruction",
+        target_label=f"{sample_id} clean",
+        save_path_linear=save_dir / f"split_panel_scatter_{split_name}_{sample_id}_p_{p_tag}.png",
+        save_path_log=save_dir / f"split_panel_scatter_log_gene_mean_{split_name}_{sample_id}_p_{p_tag}.png",
+    )
+
+    selected_genes = select_high_low_genes(
+        gene_names=np.asarray(gene_names, dtype=object),
+        mean_target=mean_target,
+        n_high=RECON_PANEL_TOP_HIGH,
+        n_low=RECON_PANEL_TOP_LOW,
+    )
+
+    print("\nSelected genes for split-panel spatial plots:")
+    print(selected_genes)
+
+    selected_gene_df = gene_summary[gene_summary["gene"].isin(selected_genes)].copy()
+    selected_gene_df.to_csv(
+        save_dir / f"split_panel_selected_genes_{split_name}_{sample_id}_p_{p_tag}.csv",
+        index=False,
+    )
+
+    gene_to_idx_full = {g: i for i, g in enumerate(pd.Index(gene_names).astype(str))}
+
+    plot_selected_gene_spatial_triplets(
+        selected_genes=selected_genes,
+        gene_to_idx=gene_to_idx_full,
+        adata_input=adata_clean,
+        X_input=X_corrupt,
+        X_recon=X_recon_expected,
+        adata_target=adata_clean,
+        X_target=X_clean,
+        save_path=save_dir / f"split_panel_gene_spatial_{split_name}_{sample_id}_p_{p_tag}.png",
+        label_input=f"{sample_id} corrupted",
+        label_recon=f"{sample_id} through VAE",
+        label_target=f"{sample_id} clean",
     )
 
 
@@ -1487,7 +1834,6 @@ def run_pair_analysis(
     X5k_in = np.clip(_to_dense_float32(adata_5k.X), 0.0, None)
     Xv1 = np.clip(_to_dense_float32(adata_v1.X), 0.0, None)
 
-    # Expected decode for metrics / scatter / spatial plots
     X5k_recon_expected, pi_vec = zinb_expected_counts_batched(
         model=model,
         X_in=X5k_in,
@@ -1496,7 +1842,6 @@ def run_pair_analysis(
         batch_size=PAIR_INFER_BATCH_SIZE,
     )
 
-    # Single sampled ZINB draw for histogram plots only
     X5k_recon_sampled = zinb_sample_once_batched(
         model=model,
         X_in=X5k_in,
@@ -1526,14 +1871,7 @@ def run_pair_analysis(
 
     det_input = (X5k_in_pair > 0).mean(axis=0)
     det_target = (Xv1_pair > 0).mean(axis=0)
-
-    mu_nb_pair = X5k_recon_pair / (1.0 - pi_pair[None, :] + 1e-8)
-    nb_p0_pair = np.power(
-        theta_pair[None, :] / (theta_pair[None, :] + np.clip(mu_nb_pair, 0.0, None) + 1e-8),
-        theta_pair[None, :],
-    )
-    p0_pair = pi_pair[None, :] + (1.0 - pi_pair[None, :]) * nb_p0_pair
-    det_recon = (1.0 - p0_pair).mean(axis=0)
+    det_recon = expected_detection_rate_from_zinb_expected_counts(X5k_recon_pair, theta_pair, pi_pair)
 
     rmse_mean_input, r2_mean_input = rmse_and_r2(mean_input, mean_target)
     rmse_mean_recon, r2_mean_recon = rmse_and_r2(mean_recon, mean_target)
@@ -1563,49 +1901,20 @@ def run_pair_analysis(
     }).sort_values("mean_target", ascending=False).reset_index(drop=True)
     gene_summary.to_csv(save_dir / f"pair_gene_summary_{PAIR_5K_ID}_to_{PAIR_V1_ID}.csv", index=False)
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 11))
-
-    plot_exact_scatter_with_fit(
-        x=mean_target,
-        y=mean_input,
-        title=f"Gene mean: {PAIR_5K_ID} input vs {PAIR_V1_ID}",
-        x_label=f"{PAIR_V1_ID} gene mean",
-        y_label=f"{PAIR_5K_ID} input gene mean",
-        color="#1f77b4",
-        ax=axes[0, 0],
+    save_reconstruction_scatter_suite(
+        mean_input=mean_input,
+        mean_recon=mean_recon,
+        mean_target=mean_target,
+        det_input=det_input,
+        det_recon=det_recon,
+        det_target=det_target,
+        title_prefix=f"Pair analysis: {PAIR_5K_ID} -> VAE -> {PAIR_V1_ID}",
+        input_label=f"{PAIR_5K_ID} input",
+        recon_label="Reconstruction",
+        target_label=f"{PAIR_V1_ID} target",
+        save_path_linear=save_dir / f"pair_scatter_{PAIR_5K_ID}_to_{PAIR_V1_ID}.png",
+        save_path_log=save_dir / f"pair_scatter_log_gene_mean_{PAIR_5K_ID}_to_{PAIR_V1_ID}.png",
     )
-    plot_exact_scatter_with_fit(
-        x=mean_target,
-        y=mean_recon,
-        title=f"Gene mean: reconstruction vs {PAIR_V1_ID}",
-        x_label=f"{PAIR_V1_ID} gene mean",
-        y_label="Reconstructed gene mean",
-        color="#E68613",
-        ax=axes[0, 1],
-    )
-    plot_exact_scatter_with_fit(
-        x=det_target,
-        y=det_input,
-        title=f"Detection: {PAIR_5K_ID} input vs {PAIR_V1_ID}",
-        x_label=f"{PAIR_V1_ID} detection rate",
-        y_label=f"{PAIR_5K_ID} input detection rate",
-        color="#1f77b4",
-        ax=axes[1, 0],
-    )
-    plot_exact_scatter_with_fit(
-        x=det_target,
-        y=det_recon,
-        title=f"Detection: reconstruction vs {PAIR_V1_ID}",
-        x_label=f"{PAIR_V1_ID} detection rate",
-        y_label="Reconstructed detection rate",
-        color="#E68613",
-        ax=axes[1, 1],
-    )
-
-    fig.suptitle(f"Pair analysis: {PAIR_5K_ID} -> VAE -> {PAIR_V1_ID}", y=1.002)
-    plt.tight_layout()
-    fig.savefig(save_dir / f"pair_scatter_{PAIR_5K_ID}_to_{PAIR_V1_ID}.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
 
     selected_genes = select_high_low_genes(
         gene_names=np.asarray(common_pair_genes, dtype=object),
@@ -1624,7 +1933,6 @@ def run_pair_analysis(
 
     gene_to_idx_pair = {g: i for i, g in enumerate(common_pair_genes.astype(str))}
 
-    # Histograms now use the single sampled ZINB draw.
     plot_selected_gene_histograms(
         selected_genes=selected_genes,
         gene_to_idx=gene_to_idx_pair,
@@ -1640,13 +1948,14 @@ def run_pair_analysis(
     adata_5k_pair = adata_5k[:, common_pair_genes].copy()
     adata_v1_pair = adata_v1[:, common_pair_genes].copy()
 
-    # Spatial plots remain based on expected reconstruction.
     plot_selected_gene_spatial_triplets(
         selected_genes=selected_genes,
         gene_to_idx=gene_to_idx_pair,
         adata_input=adata_5k_pair,
+        X_input=X5k_in_pair,
         X_recon=X5k_recon_pair,
         adata_target=adata_v1_pair,
+        X_target=Xv1_pair,
         save_path=save_dir / f"pair_gene_spatial_{PAIR_5K_ID}_to_{PAIR_V1_ID}.png",
         label_input=f"{PAIR_5K_ID} input",
         label_recon=f"{PAIR_5K_ID} through VAE",
@@ -1657,7 +1966,6 @@ def run_pair_analysis(
 def main():
     t0 = time.time()
 
-    # Device and checkpoint
     torch.set_float32_matmul_precision("high")
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
@@ -1721,7 +2029,6 @@ def main():
     if ckpt.get("best_val_loss") is not None:
         print(f"Checkpoint best_val_loss: {float(ckpt['best_val_loss']):.6f}")
 
-    # Load the requested panels
     available_ids = sorted(
         p.name.replace("_xenium_cell_level.h5ad", "")
         for p in ANN_DIR.glob("*_xenium_cell_level.h5ad")
@@ -1735,7 +2042,6 @@ def main():
     test_b_panel_ids, _ = _select_available_ids(split_samples_test_b, available_set)
     test_c_panel_ids, _ = _select_available_ids(split_samples_test_c, available_set)
 
-    # The pair analysis uses these specifically, so make sure we request them too.
     requested_ids = sorted(set(train_panel_ids + val_panel_ids + test_panel_ids + [PAIR_5K_ID, PAIR_V1_ID]))
 
     panel_data = {}
@@ -1794,7 +2100,6 @@ def main():
             f"removed={n_removed} ({pct_removed:.1f}%), kept_genes={len(rec['gene_names'])}"
         )
 
-    # Main evaluation
     if RUN_GLOBAL_TEST_EVAL:
         run_global_test_evaluation(
             panel_data=panel_data,
@@ -1811,7 +2116,7 @@ def main():
             save_dir=SAVE_DIR,
         )
 
-    if RUN_SINGLE_PANEL_GENE_DISTRIBUTIONS:
+    if RUN_SINGLE_PANEL_GENE_DISTRIBUTIONS or RUN_SPLIT_PANEL_RECON_ANALYSIS:
         eval_p_values = np.asarray(
             QUICK_P_VALUES if QUICK_MODE else FULL_P_VALUES,
             dtype=np.float64,
@@ -1833,12 +2138,34 @@ def main():
 
         single_panel_p = float(eval_p_values[single_panel_version_idx])
 
+    if RUN_SINGLE_PANEL_GENE_DISTRIBUTIONS:
         for split_name in ["A", "B", "C"]:
             sample_id = SPLIT_PANEL_FOR_HIST.get(split_name)
             if sample_id is None:
                 continue
 
             run_single_panel_gene_distribution_analysis(
+                panel_data=panel_data,
+                test_panel_ids=test_panel_ids,
+                sample_id=sample_id,
+                split_name=split_name,
+                gene_names=gene_names,
+                model=model,
+                log_theta=log_theta,
+                logit_pi=logit_pi,
+                device=device,
+                save_dir=SAVE_DIR,
+                version_idx=single_panel_version_idx,
+                p_val=single_panel_p,
+            )
+
+    if RUN_SPLIT_PANEL_RECON_ANALYSIS:
+        for split_name in ["A", "B", "C"]:
+            sample_id = SPLIT_PANEL_FOR_RECON_ANALYSIS.get(split_name)
+            if sample_id is None:
+                continue
+
+            run_split_panel_reconstruction_analysis(
                 panel_data=panel_data,
                 test_panel_ids=test_panel_ids,
                 sample_id=sample_id,

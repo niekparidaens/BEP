@@ -49,7 +49,7 @@ def _load_sample_backed(sample_id: str, read_mode=READ_MODE):
 threshold = 40
 genes_threshold = 5
 
-p_non_overlap_values = [0.19]
+p_non_overlap_values = [0.19, 0.21, 0.25, 0.31]
 base_seed = 42
 
 split_samples_train = [

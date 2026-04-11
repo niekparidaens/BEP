@@ -980,7 +980,7 @@ plt.show()
 # Save trained ZINB VAE weights
 save_dir = SAVE_DIR
 save_dir.mkdir(parents=True, exist_ok=True)
-weights_path = save_dir / "VAE_ZINB_weights-07-04-2026"
+weights_path = save_dir / "VAE_ZINB_weights-4-p-values"
 
 torch.save(
     {

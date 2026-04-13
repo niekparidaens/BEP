@@ -159,6 +159,48 @@ def _stable_string_seed(text: str) -> int:
     return int(sum((i + 1) * ord(ch) for i, ch in enumerate(text)))
 
 
+def _clean_path_part(part):
+    part = str(part).strip()
+    if not part:
+        return ""
+    for old, new in [
+        (" ", "_"),
+        ("/", "_"),
+        ("\\", "_"),
+        ("->", "_to_"),
+        (":", "_"),
+        ("(", ""),
+        (")", ""),
+        (",", ""),
+        ("=", "_"),
+    ]:
+        part = part.replace(old, new)
+    while "__" in part:
+        part = part.replace("__", "_")
+    return part.strip("_")
+
+
+def format_p_tag(p_val):
+    return f"{float(p_val):.3f}".replace(".", "p")
+
+
+def build_output_path(save_dir, category, name, ext, split=None, sample_id=None, p_val=None, extra_parts=None):
+    parts = [category]
+    if split is not None:
+        parts.append(f"split_{split}")
+    if sample_id is not None:
+        parts.append(f"sample_{sample_id}")
+    if p_val is not None:
+        parts.append(f"p_{format_p_tag(p_val)}")
+    if extra_parts:
+        parts.extend(extra_parts)
+    parts.append(name)
+
+    stem = "__".join(filter(None, (_clean_path_part(p) for p in parts)))
+    ext = ext.lstrip(".")
+    return save_dir / f"{stem}.{ext}"
+
+
 def _compute_qc_chunked(adata_backed, chunk_size=4096):
     """
     Compute total counts and detected genes without reading the whole matrix at once.
@@ -234,6 +276,38 @@ def _panel_global_bases(panel_data, panel_ids):
         bases[sid] = offset
         offset += int(panel_data[sid]["cell_pos"].size)
     return bases
+
+
+def compute_panel_present_gene_mask(panel_data, sample_id, common_genes):
+    common_genes = pd.Index(common_genes).astype(str)
+    mask = np.zeros(len(common_genes), dtype=bool)
+    if sample_id not in panel_data:
+        return mask
+
+    idx = common_genes.get_indexer(pd.Index(panel_data[sample_id]["gene_names"]).astype(str))
+    idx = idx[idx >= 0]
+    mask[idx] = True
+    return mask
+
+
+def compute_train_seen_gene_mask(panel_data, train_panel_ids, common_genes):
+    common_genes = pd.Index(common_genes).astype(str)
+    mask = np.zeros(len(common_genes), dtype=bool)
+
+    for sid in train_panel_ids:
+        if sid not in panel_data:
+            continue
+        idx = common_genes.get_indexer(pd.Index(panel_data[sid]["gene_names"]).astype(str))
+        idx = idx[idx >= 0]
+        mask[idx] = True
+
+    return mask
+
+
+def compute_valid_overlap_gene_mask(panel_data, sample_id, common_genes, train_seen_gene_mask):
+    present_mask = compute_panel_present_gene_mask(panel_data, sample_id, common_genes)
+    train_seen_gene_mask = np.asarray(train_seen_gene_mask, dtype=bool)
+    return present_mask & train_seen_gene_mask
 
 
 # Model
@@ -615,7 +689,7 @@ def init_metric_acc():
     }
 
 
-def update_metric_acc(acc, pred, true):
+def update_metric_acc(acc, pred, true, gene_mask=None):
     """
     We explicitly broadcast pred and true first.
 
@@ -625,6 +699,16 @@ def update_metric_acc(acc, pred, true):
     pred64 = np.asarray(pred, dtype=np.float64)
     true64 = np.asarray(true, dtype=np.float64)
     pred64, true64 = np.broadcast_arrays(pred64, true64)
+
+    if gene_mask is not None:
+        gene_mask = np.asarray(gene_mask, dtype=bool)
+        if gene_mask.ndim != 1:
+            raise ValueError("gene_mask must be a 1D boolean mask over genes.")
+        pred64 = pred64[..., gene_mask]
+        true64 = true64[..., gene_mask]
+
+    if true64.size == 0:
+        return
 
     pred64 = np.clip(pred64, 0.0, None)
     true64 = np.clip(true64, 0.0, None)
@@ -1073,8 +1157,8 @@ def plot_selected_gene_spatial_triplets(
     X_input=None,
     X_target=None,
 ):
-    x_in, y_in, in_source = _find_spatial_xy(adata_input)
-    x_tar, y_tar, tar_source = _find_spatial_xy(adata_target)
+    x_in, y_in, _ = _find_spatial_xy(adata_input)
+    x_tar, y_tar, _ = _find_spatial_xy(adata_target)
 
     if x_in is None or x_tar is None:
         print("Skipping spatial gene plots: no spatial coordinates found.")
@@ -1090,7 +1174,14 @@ def plot_selected_gene_spatial_triplets(
     if X_target is not None:
         X_target = np.asarray(X_target, dtype=np.float32)
 
-    fig, axes = plt.subplots(n_rows, 3, figsize=(15, 4.2 * n_rows), squeeze=False)
+    fig = plt.figure(figsize=(16, 4.0 * n_rows))
+    gs = fig.add_gridspec(
+        n_rows,
+        4,
+        width_ratios=[1, 1, 1, 0.06],
+        wspace=0.18,
+        hspace=0.30,
+    )
 
     for i, gene in enumerate(selected_genes):
         g_idx = gene_to_idx[gene]
@@ -1114,34 +1205,36 @@ def plot_selected_gene_spatial_triplets(
             1e-6,
         ))
 
-        ax0, ax1, ax2 = axes[i]
+        ax0 = fig.add_subplot(gs[i, 0])
+        ax1 = fig.add_subplot(gs[i, 1])
+        ax2 = fig.add_subplot(gs[i, 2])
+        cax = fig.add_subplot(gs[i, 3])
 
-        sc0 = ax0.scatter(x_in, y_in, c=expr_input, s=4, cmap="viridis", vmin=0.0, vmax=vmax)
+        ax0.scatter(x_in, y_in, c=expr_input, s=4, cmap="viridis", vmin=0.0, vmax=vmax)
         ax0.set_title(f"{gene} | {label_input}")
-        ax0.set_xlabel(in_source)
+        ax0.set_xlabel("x")
         ax0.set_ylabel("y")
         ax0.invert_yaxis()
         ax0.set_aspect("equal", adjustable="box")
 
-        sc1 = ax1.scatter(x_in, y_in, c=expr_recon, s=4, cmap="viridis", vmin=0.0, vmax=vmax)
+        ax1.scatter(x_in, y_in, c=expr_recon, s=4, cmap="viridis", vmin=0.0, vmax=vmax)
         ax1.set_title(f"{gene} | {label_recon}")
-        ax1.set_xlabel(in_source)
+        ax1.set_xlabel("x")
         ax1.set_ylabel("y")
         ax1.invert_yaxis()
         ax1.set_aspect("equal", adjustable="box")
 
         sc2 = ax2.scatter(x_tar, y_tar, c=expr_target, s=4, cmap="viridis", vmin=0.0, vmax=vmax)
         ax2.set_title(f"{gene} | {label_target}")
-        ax2.set_xlabel(tar_source)
+        ax2.set_xlabel("x")
         ax2.set_ylabel("y")
         ax2.invert_yaxis()
         ax2.set_aspect("equal", adjustable="box")
 
-        cbar = fig.colorbar(sc2, ax=[ax0, ax1, ax2], fraction=0.02, pad=0.01)
+        cbar = fig.colorbar(sc2, cax=cax)
         cbar.set_label("log1p(count)")
 
-    fig.suptitle("Selected spatial gene patterns", y=1.002)
-    plt.tight_layout()
+    fig.suptitle("Selected spatial gene patterns", y=0.995)
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -1154,6 +1247,7 @@ def run_global_test_evaluation(
     test_b_panel_ids,
     test_c_panel_ids,
     gene_names,
+    train_seen_gene_mask,
     model,
     log_theta,
     logit_pi,
@@ -1182,6 +1276,11 @@ def run_global_test_evaluation(
     split_name_by_sid = {sid: "A" for sid in test_a_panel_ids}
     split_name_by_sid.update({sid: "B" for sid in test_b_panel_ids})
     split_name_by_sid.update({sid: "C" for sid in test_c_panel_ids})
+
+    sample_valid_overlap_mask_by_sid = {
+        sid: compute_valid_overlap_gene_mask(panel_data, sid, gene_names, train_seen_gene_mask)
+        for sid in test_panel_ids
+    }
 
     print(f"Eval mode: {'QUICK' if QUICK_MODE else 'FULL'}")
     print(f"Cells used per p: {n_eval_cells} / {base_n_cells}")
@@ -1213,6 +1312,13 @@ def run_global_test_evaluation(
         (int(v), split_name_by_sid.get(sid), sid, m): init_metric_acc()
         for v in range(len(eval_p_values))
         for sid in test_panel_ids
+        for m in METHODS
+    }
+    per_panel_valid_overlap_acc = {
+        (int(v), split_name_by_sid.get(sid), sid, m): init_metric_acc()
+        for v in range(len(eval_p_values))
+        for sid in test_panel_ids
+        if split_name_by_sid.get(sid) in {"B", "C"}
         for m in METHODS
     }
 
@@ -1298,6 +1404,28 @@ def run_global_test_evaluation(
                 update_metric_acc(per_panel_acc[(version_idx, split_name, sample_id, METHOD_ID)], xb_np, yb_np)
                 update_metric_acc(per_panel_acc[(version_idx, split_name, sample_id, METHOD_MEAN)], gene_mean_train[None, :], yb_np)
 
+                if split_name in {"B", "C"}:
+                    valid_overlap_mask = sample_valid_overlap_mask_by_sid[sample_id]
+                    if np.any(valid_overlap_mask):
+                        update_metric_acc(
+                            per_panel_valid_overlap_acc[(version_idx, split_name, sample_id, METHOD_VAE)],
+                            recon_expected,
+                            yb_np,
+                            gene_mask=valid_overlap_mask,
+                        )
+                        update_metric_acc(
+                            per_panel_valid_overlap_acc[(version_idx, split_name, sample_id, METHOD_ID)],
+                            xb_np,
+                            yb_np,
+                            gene_mask=valid_overlap_mask,
+                        )
+                        update_metric_acc(
+                            per_panel_valid_overlap_acc[(version_idx, split_name, sample_id, METHOD_MEAN)],
+                            gene_mean_train[None, :],
+                            yb_np,
+                            gene_mask=valid_overlap_mask,
+                        )
+
     if loss_weight == 0:
         raise RuntimeError("No evaluation batches were produced.")
 
@@ -1313,12 +1441,12 @@ def run_global_test_evaluation(
     ])
     print("\nGlobal test summary:")
     print(summary_table.to_string(index=False))
-    summary_table.to_csv(save_dir / "eval_summary.csv", index=False)
+    summary_table.to_csv(build_output_path(save_dir, "global", "summary", "csv"), index=False)
 
     scoreboard_overall = build_scoreboard_from_acc_dict(overall_acc)
     print("\nOverall scoreboard:")
     print(scoreboard_overall.to_string(index=False))
-    scoreboard_overall.to_csv(save_dir / "eval_scoreboard_overall.csv", index=False)
+    scoreboard_overall.to_csv(build_output_path(save_dir, "global", "scoreboard_overall", "csv"), index=False)
 
     save_bar_plot(
         scoreboard_overall,
@@ -1326,7 +1454,7 @@ def run_global_test_evaluation(
         value_col="rmse_counts",
         title="Overall test-set comparison",
         ylabel="RMSE on counts (lower is better)",
-        save_path=save_dir / "eval_scoreboard_overall_rmse_counts.png",
+        save_path=build_output_path(save_dir, "global", "scoreboard_overall_rmse_counts", "png"),
     )
     save_bar_plot(
         scoreboard_overall,
@@ -1334,7 +1462,7 @@ def run_global_test_evaluation(
         value_col="r2_counts",
         title="Overall test-set comparison",
         ylabel="R² on counts (higher is better)",
-        save_path=save_dir / "eval_scoreboard_overall_r2_counts.png",
+        save_path=build_output_path(save_dir, "global", "scoreboard_overall_r2_counts", "png"),
     )
 
     per_p_rows = []
@@ -1364,11 +1492,11 @@ def run_global_test_evaluation(
 
     print("\nPer-p summary:")
     print(per_p_summary.to_string(index=False))
-    per_p_summary.to_csv(save_dir / "eval_per_p_summary.csv", index=False)
+    per_p_summary.to_csv(build_output_path(save_dir, "global", "per_p_summary", "csv"), index=False)
 
     print("\nPer-p scoreboard:")
     print(scoreboard_by_p.to_string(index=False))
-    scoreboard_by_p.to_csv(save_dir / "eval_scoreboard_by_p.csv", index=False)
+    scoreboard_by_p.to_csv(build_output_path(save_dir, "global", "scoreboard_by_p", "csv"), index=False)
 
     split_rows = []
     for version_idx, p_val in enumerate(eval_p_values):
@@ -1397,7 +1525,7 @@ def run_global_test_evaluation(
     )
     print("\nPer-split scoreboard:")
     print(scoreboard_by_split.to_string(index=False))
-    scoreboard_by_split.to_csv(save_dir / "eval_scoreboard_by_split.csv", index=False)
+    scoreboard_by_split.to_csv(build_output_path(save_dir, "split", "scoreboard_by_split", "csv"), index=False)
 
     for split_name in ["A", "B", "C"]:
         df_split = scoreboard_by_split[scoreboard_by_split["split"] == split_name].copy()
@@ -1413,7 +1541,7 @@ def run_global_test_evaluation(
             value_col="rmse_counts",
             title=f"Split {split_name} comparison (p={best_p:.2f})",
             ylabel="RMSE on counts",
-            save_path=save_dir / f"eval_split_{split_name}_rmse_counts.png",
+            save_path=build_output_path(save_dir, "split", "method_comparison_rmse_counts", "png", split=split_name, p_val=best_p),
         )
         save_bar_plot(
             df_best,
@@ -1421,7 +1549,7 @@ def run_global_test_evaluation(
             value_col="r2_counts",
             title=f"Split {split_name} comparison (p={best_p:.2f})",
             ylabel="R² on counts",
-            save_path=save_dir / f"eval_split_{split_name}_r2_counts.png",
+            save_path=build_output_path(save_dir, "split", "method_comparison_r2_counts", "png", split=split_name, p_val=best_p),
         )
 
     panel_rows = []
@@ -1454,10 +1582,10 @@ def run_global_test_evaluation(
     )
     print("\nPer-panel scoreboard:")
     print(scoreboard_by_panel.to_string(index=False))
-    scoreboard_by_panel.to_csv(save_dir / "eval_scoreboard_by_panel.csv", index=False)
+    scoreboard_by_panel.to_csv(build_output_path(save_dir, "panel", "scoreboard_by_panel", "csv"), index=False)
 
     panel_summary_vae = scoreboard_by_panel[scoreboard_by_panel["method"] == METHOD_VAE].copy()
-    panel_summary_vae.to_csv(save_dir / "eval_panel_summary_vae.csv", index=False)
+    panel_summary_vae.to_csv(build_output_path(save_dir, "panel", "summary_vae", "csv"), index=False)
 
     for split_name in ["A", "B", "C"]:
         df_panel = panel_summary_vae[panel_summary_vae["split"] == split_name].copy()
@@ -1473,7 +1601,7 @@ def run_global_test_evaluation(
             value_col="rmse_counts",
             title=f"Split {split_name} | VAE per-panel RMSE (p={best_p:.2f})",
             ylabel="RMSE on counts",
-            save_path=save_dir / f"eval_split_{split_name}_vae_per_panel_rmse_counts.png",
+            save_path=build_output_path(save_dir, "panel", "vae_per_panel_rmse_counts", "png", split=split_name, p_val=best_p),
         )
         save_bar_plot(
             df_best,
@@ -1481,8 +1609,94 @@ def run_global_test_evaluation(
             value_col="r2_counts",
             title=f"Split {split_name} | VAE per-panel R² (p={best_p:.2f})",
             ylabel="R² on counts",
-            save_path=save_dir / f"eval_split_{split_name}_vae_per_panel_r2_counts.png",
+            save_path=build_output_path(save_dir, "panel", "vae_per_panel_r2_counts", "png", split=split_name, p_val=best_p),
         )
+
+    panel_valid_overlap_rows = []
+    for version_idx, p_val in enumerate(eval_p_values):
+        for split_name in ["B", "C"]:
+            split_panel_ids = [sid for sid in test_panel_ids if split_name_by_sid.get(sid) == split_name]
+            for sample_id in split_panel_ids:
+                n_valid_genes = int(sample_valid_overlap_mask_by_sid[sample_id].sum())
+                for method_name in METHODS:
+                    out = finalize_metric_acc(per_panel_valid_overlap_acc[(version_idx, split_name, sample_id, method_name)])
+                    if out["n_cells"] == 0:
+                        continue
+                    panel_valid_overlap_rows.append({
+                        "p_non_overlap": float(p_val),
+                        "split": split_name,
+                        "sample_id": sample_id,
+                        "method": method_name,
+                        "n_valid_overlap_genes": n_valid_genes,
+                        "n_cells": out["n_cells"],
+                        "rmse_counts": out["rmse_counts"],
+                        "r2_counts": out["r2_counts"],
+                        "rmse_log1p": out["rmse_log1p"],
+                        "r2_log1p": out["r2_log1p"],
+                        "mse_counts": out["mse_counts"],
+                        "mse_log1p": out["mse_log1p"],
+                    })
+
+    if panel_valid_overlap_rows:
+        scoreboard_by_panel_valid_overlap = (
+            pd.DataFrame(panel_valid_overlap_rows)
+            .sort_values(["p_non_overlap", "split", "sample_id", "rmse_counts"], ascending=[True, True, True, True])
+            .reset_index(drop=True)
+        )
+        print("\nPer-panel scoreboard on valid train-overlap genes (B/C):")
+        print(scoreboard_by_panel_valid_overlap.to_string(index=False))
+        scoreboard_by_panel_valid_overlap.to_csv(
+            build_output_path(save_dir, "panel", "scoreboard_by_panel_valid_train_overlap", "csv"),
+            index=False,
+        )
+
+        panel_valid_overlap_vae = scoreboard_by_panel_valid_overlap[
+            scoreboard_by_panel_valid_overlap["method"] == METHOD_VAE
+        ].copy()
+        panel_valid_overlap_vae.to_csv(
+            build_output_path(save_dir, "panel", "summary_vae_valid_train_overlap", "csv"),
+            index=False,
+        )
+
+        for split_name in ["B", "C"]:
+            df_panel = panel_valid_overlap_vae[panel_valid_overlap_vae["split"] == split_name].copy()
+            if df_panel.empty:
+                continue
+
+            best_p = float(df_panel["p_non_overlap"].iloc[0])
+            df_best = df_panel[df_panel["p_non_overlap"] == best_p].sort_values("rmse_counts").copy()
+
+            save_bar_plot(
+                df_best,
+                category_col="sample_id",
+                value_col="rmse_counts",
+                title=f"Split {split_name} | VAE RMSE on valid train-overlap genes (p={best_p:.2f})",
+                ylabel="RMSE on counts",
+                save_path=build_output_path(
+                    save_dir,
+                    "panel",
+                    "vae_per_panel_valid_train_overlap_rmse_counts",
+                    "png",
+                    split=split_name,
+                    p_val=best_p,
+                ),
+            )
+            save_bar_plot(
+                df_best,
+                category_col="sample_id",
+                value_col="r2_counts",
+                title=f"Split {split_name} | VAE R² on valid train-overlap genes (p={best_p:.2f})",
+                ylabel="R² on counts",
+                save_path=build_output_path(
+                    save_dir,
+                    "panel",
+                    "vae_per_panel_valid_train_overlap_r2_counts",
+                    "png",
+                    split=split_name,
+                    p_val=best_p,
+                ),
+            )
+
 
 
 def run_single_panel_gene_distribution_analysis(
@@ -1604,15 +1818,21 @@ def run_single_panel_gene_distribution_analysis(
     X_recon_hist_sample = np.vstack(recon_hist_sample_blocks)
     X_clean = np.vstack(clean_blocks)
 
-    p_tag = f"{p_val:.3f}".replace(".", "p")
-
     plot_selected_gene_histograms(
         selected_genes=selected_genes,
         gene_to_idx=gene_to_idx_local,
         X_input=X_corrupt,
         X_recon=X_recon_hist_sample,
         X_target=X_clean,
-        save_path=save_dir / f"single_panel_{split_name}_{sample_id}_gene_histograms_p_{p_tag}.png",
+        save_path=build_output_path(
+            save_dir,
+            "single_panel",
+            "gene_histograms",
+            "png",
+            split=split_name,
+            sample_id=sample_id,
+            p_val=p_val,
+        ),
         label_input=f"{sample_id} corrupted",
         label_recon=f"{sample_id} through VAE (1x ZINB sample)",
         label_target=f"{sample_id} clean",
@@ -1632,9 +1852,18 @@ def run_single_panel_gene_distribution_analysis(
     })
 
     selected_gene_summary.to_csv(
-        save_dir / f"single_panel_{split_name}_{sample_id}_selected_gene_summary_p_{p_tag}.csv",
+        build_output_path(
+            save_dir,
+            "single_panel",
+            "selected_gene_summary",
+            "csv",
+            split=split_name,
+            sample_id=sample_id,
+            p_val=p_val,
+        ),
         index=False,
     )
+
 
 
 def run_split_panel_reconstruction_analysis(
@@ -1643,6 +1872,7 @@ def run_split_panel_reconstruction_analysis(
     sample_id,
     split_name,
     gene_names,
+    train_seen_gene_mask,
     model,
     log_theta,
     logit_pi,
@@ -1662,6 +1892,20 @@ def run_split_panel_reconstruction_analysis(
 
     print(f"\nRunning reconstruction analysis for split {split_name}, sample {sample_id}, p={p_val:.3f}")
 
+    valid_gene_mask = compute_valid_overlap_gene_mask(
+        panel_data=panel_data,
+        sample_id=sample_id,
+        common_genes=gene_names,
+        train_seen_gene_mask=train_seen_gene_mask,
+    )
+    valid_gene_idx = np.flatnonzero(valid_gene_mask)
+    if valid_gene_idx.size == 0:
+        print(f"Skipping reconstruction analysis for split {split_name}: no valid train-overlap genes for {sample_id}.")
+        return
+
+    gene_names_valid = np.asarray(gene_names, dtype=object)[valid_gene_idx]
+    print(f"Using {valid_gene_idx.size} valid overlap genes for split {split_name}, sample {sample_id}.")
+
     adata_clean = materialize_panel_in_gene_space(
         panel_data=panel_data,
         sample_id=sample_id,
@@ -1669,16 +1913,16 @@ def run_split_panel_reconstruction_analysis(
         chunk_size=IO_CHUNK_SIZE,
     )
 
-    X_clean = np.clip(_to_dense_float32(adata_clean.X), 0.0, None)
-    if X_clean.shape[0] == 0:
+    X_clean_full = np.clip(_to_dense_float32(adata_clean.X), 0.0, None)
+    if X_clean_full.shape[0] == 0:
         print(f"Skipping reconstruction analysis for split {split_name}: sample {sample_id} has no cells.")
         return
 
     panel_base = full_test_bases[sample_id]
-    global_idx_np = panel_base + np.arange(X_clean.shape[0], dtype=np.int64)
+    global_idx_np = panel_base + np.arange(X_clean_full.shape[0], dtype=np.int64)
 
-    X_corrupt = corrupt_batch_deterministic(
-        x_clean=X_clean,
+    X_corrupt_full = corrupt_batch_deterministic(
+        x_clean=X_clean_full,
         global_idx_np=global_idx_np,
         version_idx=version_idx,
         p_val=float(p_val),
@@ -1686,15 +1930,21 @@ def run_split_panel_reconstruction_analysis(
         exact=EXACT_CORRUPTION,
     )
 
-    X_recon_expected, pi_vec = zinb_expected_counts_batched(
+    X_recon_expected_full, pi_vec_full = zinb_expected_counts_batched(
         model=model,
-        X_in=X_corrupt,
+        X_in=X_corrupt_full,
         logit_pi=logit_pi,
         device=device,
         batch_size=PAIR_INFER_BATCH_SIZE,
     )
 
-    theta_vec = F.softplus(log_theta.detach()).cpu().numpy().astype(np.float32)
+    theta_vec_full = F.softplus(log_theta.detach()).cpu().numpy().astype(np.float32)
+
+    X_clean = X_clean_full[:, valid_gene_idx]
+    X_corrupt = X_corrupt_full[:, valid_gene_idx]
+    X_recon_expected = X_recon_expected_full[:, valid_gene_idx]
+    theta_vec = theta_vec_full[valid_gene_idx]
+    pi_vec = pi_vec_full[valid_gene_idx]
 
     mean_input = X_corrupt.mean(axis=0)
     mean_recon = X_recon_expected.mean(axis=0)
@@ -1709,8 +1959,6 @@ def run_split_panel_reconstruction_analysis(
     rmse_det_input, r2_det_input = rmse_and_r2(det_input, det_target)
     rmse_det_recon, r2_det_recon = rmse_and_r2(det_recon, det_target)
 
-    p_tag = f"{p_val:.3f}".replace(".", "p")
-
     recon_summary = pd.DataFrame([
         {"comparison": "corrupted_vs_clean_gene_mean", "rmse": rmse_mean_input, "r2": r2_mean_input},
         {"comparison": "recon_vs_clean_gene_mean", "rmse": rmse_mean_recon, "r2": r2_mean_recon},
@@ -1720,12 +1968,20 @@ def run_split_panel_reconstruction_analysis(
     print("\nSplit-panel reconstruction summary:")
     print(recon_summary.to_string(index=False))
     recon_summary.to_csv(
-        save_dir / f"split_panel_summary_{split_name}_{sample_id}_p_{p_tag}.csv",
+        build_output_path(
+            save_dir,
+            "split_recon",
+            "summary_valid_train_overlap",
+            "csv",
+            split=split_name,
+            sample_id=sample_id,
+            p_val=p_val,
+        ),
         index=False,
     )
 
     gene_summary = pd.DataFrame({
-        "gene": pd.Index(gene_names).astype(str),
+        "gene": pd.Index(gene_names_valid).astype(str),
         "mean_corrupted": mean_input,
         "mean_recon": mean_recon,
         "mean_clean": mean_target,
@@ -1736,7 +1992,15 @@ def run_split_panel_reconstruction_analysis(
         "abs_err_mean_recon_vs_clean": np.abs(mean_recon - mean_target),
     }).sort_values("mean_clean", ascending=False).reset_index(drop=True)
     gene_summary.to_csv(
-        save_dir / f"split_panel_gene_summary_{split_name}_{sample_id}_p_{p_tag}.csv",
+        build_output_path(
+            save_dir,
+            "split_recon",
+            "gene_summary_valid_train_overlap",
+            "csv",
+            split=split_name,
+            sample_id=sample_id,
+            p_val=p_val,
+        ),
         index=False,
     )
 
@@ -1747,16 +2011,32 @@ def run_split_panel_reconstruction_analysis(
         det_input=det_input,
         det_recon=det_recon,
         det_target=det_target,
-        title_prefix=f"Split {split_name}: {sample_id} corrupted -> VAE -> clean",
+        title_prefix=f"Split {split_name}: {sample_id} corrupted -> VAE -> clean | valid train-overlap genes",
         input_label=f"{sample_id} corrupted",
         recon_label="Reconstruction",
         target_label=f"{sample_id} clean",
-        save_path_linear=save_dir / f"split_panel_scatter_{split_name}_{sample_id}_p_{p_tag}.png",
-        save_path_log=save_dir / f"split_panel_scatter_log_gene_mean_{split_name}_{sample_id}_p_{p_tag}.png",
+        save_path_linear=build_output_path(
+            save_dir,
+            "split_recon",
+            "scatter_valid_train_overlap",
+            "png",
+            split=split_name,
+            sample_id=sample_id,
+            p_val=p_val,
+        ),
+        save_path_log=build_output_path(
+            save_dir,
+            "split_recon",
+            "scatter_log_gene_mean_valid_train_overlap",
+            "png",
+            split=split_name,
+            sample_id=sample_id,
+            p_val=p_val,
+        ),
     )
 
     selected_genes = select_high_low_genes(
-        gene_names=np.asarray(gene_names, dtype=object),
+        gene_names=np.asarray(gene_names_valid, dtype=object),
         mean_target=mean_target,
         n_high=RECON_PANEL_TOP_HIGH,
         n_low=RECON_PANEL_TOP_LOW,
@@ -1767,25 +2047,42 @@ def run_split_panel_reconstruction_analysis(
 
     selected_gene_df = gene_summary[gene_summary["gene"].isin(selected_genes)].copy()
     selected_gene_df.to_csv(
-        save_dir / f"split_panel_selected_genes_{split_name}_{sample_id}_p_{p_tag}.csv",
+        build_output_path(
+            save_dir,
+            "split_recon",
+            "selected_genes_valid_train_overlap",
+            "csv",
+            split=split_name,
+            sample_id=sample_id,
+            p_val=p_val,
+        ),
         index=False,
     )
 
-    gene_to_idx_full = {g: i for i, g in enumerate(pd.Index(gene_names).astype(str))}
+    gene_to_idx_valid = {g: i for i, g in enumerate(pd.Index(gene_names_valid).astype(str))}
 
     plot_selected_gene_spatial_triplets(
         selected_genes=selected_genes,
-        gene_to_idx=gene_to_idx_full,
+        gene_to_idx=gene_to_idx_valid,
         adata_input=adata_clean,
         X_input=X_corrupt,
         X_recon=X_recon_expected,
         adata_target=adata_clean,
         X_target=X_clean,
-        save_path=save_dir / f"split_panel_gene_spatial_{split_name}_{sample_id}_p_{p_tag}.png",
+        save_path=build_output_path(
+            save_dir,
+            "split_recon",
+            "gene_spatial_valid_train_overlap",
+            "png",
+            split=split_name,
+            sample_id=sample_id,
+            p_val=p_val,
+        ),
         label_input=f"{sample_id} corrupted",
         label_recon=f"{sample_id} through VAE",
         label_target=f"{sample_id} clean",
     )
+
 
 
 def run_pair_analysis(
@@ -1886,7 +2183,16 @@ def run_pair_analysis(
     ])
     print("\nPair summary:")
     print(pair_summary.to_string(index=False))
-    pair_summary.to_csv(save_dir / f"pair_summary_{PAIR_5K_ID}_to_{PAIR_V1_ID}.csv", index=False)
+    pair_summary.to_csv(
+        build_output_path(
+            save_dir,
+            "pair",
+            "summary",
+            "csv",
+            extra_parts=[f"source_{PAIR_5K_ID}", f"target_{PAIR_V1_ID}"],
+        ),
+        index=False,
+    )
 
     gene_summary = pd.DataFrame({
         "gene": common_pair_genes.astype(str),
@@ -1899,7 +2205,16 @@ def run_pair_analysis(
         "abs_err_mean_input_vs_target": np.abs(mean_input - mean_target),
         "abs_err_mean_recon_vs_target": np.abs(mean_recon - mean_target),
     }).sort_values("mean_target", ascending=False).reset_index(drop=True)
-    gene_summary.to_csv(save_dir / f"pair_gene_summary_{PAIR_5K_ID}_to_{PAIR_V1_ID}.csv", index=False)
+    gene_summary.to_csv(
+        build_output_path(
+            save_dir,
+            "pair",
+            "gene_summary",
+            "csv",
+            extra_parts=[f"source_{PAIR_5K_ID}", f"target_{PAIR_V1_ID}"],
+        ),
+        index=False,
+    )
 
     save_reconstruction_scatter_suite(
         mean_input=mean_input,
@@ -1912,8 +2227,20 @@ def run_pair_analysis(
         input_label=f"{PAIR_5K_ID} input",
         recon_label="Reconstruction",
         target_label=f"{PAIR_V1_ID} target",
-        save_path_linear=save_dir / f"pair_scatter_{PAIR_5K_ID}_to_{PAIR_V1_ID}.png",
-        save_path_log=save_dir / f"pair_scatter_log_gene_mean_{PAIR_5K_ID}_to_{PAIR_V1_ID}.png",
+        save_path_linear=build_output_path(
+            save_dir,
+            "pair",
+            "scatter",
+            "png",
+            extra_parts=[f"source_{PAIR_5K_ID}", f"target_{PAIR_V1_ID}"],
+        ),
+        save_path_log=build_output_path(
+            save_dir,
+            "pair",
+            "scatter_log_gene_mean",
+            "png",
+            extra_parts=[f"source_{PAIR_5K_ID}", f"target_{PAIR_V1_ID}"],
+        ),
     )
 
     selected_genes = select_high_low_genes(
@@ -1924,7 +2251,13 @@ def run_pair_analysis(
     )
     selected_gene_df = gene_summary[gene_summary["gene"].isin(selected_genes)].copy()
     selected_gene_df.to_csv(
-        save_dir / f"pair_selected_genes_{PAIR_5K_ID}_to_{PAIR_V1_ID}.csv",
+        build_output_path(
+            save_dir,
+            "pair",
+            "selected_genes",
+            "csv",
+            extra_parts=[f"source_{PAIR_5K_ID}", f"target_{PAIR_V1_ID}"],
+        ),
         index=False,
     )
 
@@ -1939,7 +2272,13 @@ def run_pair_analysis(
         X_input=X5k_in_pair,
         X_recon=X5k_recon_pair_hist,
         X_target=Xv1_pair,
-        save_path=save_dir / f"pair_gene_histograms_{PAIR_5K_ID}_to_{PAIR_V1_ID}.png",
+        save_path=build_output_path(
+            save_dir,
+            "pair",
+            "gene_histograms",
+            "png",
+            extra_parts=[f"source_{PAIR_5K_ID}", f"target_{PAIR_V1_ID}"],
+        ),
         label_input=f"{PAIR_5K_ID} input",
         label_recon=f"{PAIR_5K_ID} through VAE (1x ZINB sample)",
         label_target=f"{PAIR_V1_ID} target",
@@ -1956,11 +2295,18 @@ def run_pair_analysis(
         X_recon=X5k_recon_pair,
         adata_target=adata_v1_pair,
         X_target=Xv1_pair,
-        save_path=save_dir / f"pair_gene_spatial_{PAIR_5K_ID}_to_{PAIR_V1_ID}.png",
+        save_path=build_output_path(
+            save_dir,
+            "pair",
+            "gene_spatial",
+            "png",
+            extra_parts=[f"source_{PAIR_5K_ID}", f"target_{PAIR_V1_ID}"],
+        ),
         label_input=f"{PAIR_5K_ID} input",
         label_recon=f"{PAIR_5K_ID} through VAE",
         label_target=f"{PAIR_V1_ID} target",
     )
+
 
 
 def main():
@@ -2100,6 +2446,13 @@ def main():
             f"removed={n_removed} ({pct_removed:.1f}%), kept_genes={len(rec['gene_names'])}"
         )
 
+    train_seen_gene_mask = compute_train_seen_gene_mask(
+        panel_data=panel_data,
+        train_panel_ids=train_panel_ids,
+        common_genes=gene_names,
+    )
+    print(f"Genes seen in training panels: {int(train_seen_gene_mask.sum())} / {len(gene_names)}")
+
     if RUN_GLOBAL_TEST_EVAL:
         run_global_test_evaluation(
             panel_data=panel_data,
@@ -2109,6 +2462,7 @@ def main():
             test_b_panel_ids=test_b_panel_ids,
             test_c_panel_ids=test_c_panel_ids,
             gene_names=gene_names,
+            train_seen_gene_mask=train_seen_gene_mask,
             model=model,
             log_theta=log_theta,
             logit_pi=logit_pi,
@@ -2171,6 +2525,7 @@ def main():
                 sample_id=sample_id,
                 split_name=split_name,
                 gene_names=gene_names,
+                train_seen_gene_mask=train_seen_gene_mask,
                 model=model,
                 log_theta=log_theta,
                 logit_pi=logit_pi,

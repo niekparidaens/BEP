@@ -27,7 +27,7 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 WEIGHTS_PATH = Path(
     os.environ.get(
         "WEIGHTS_PATH",
-        str(SAVE_DIR / "VAE_ZINB_weights-07-04-2026.pt"),
+        str(PROJECT_ROOT / "OUTPUTS" / "VAE_NB" / "VAE_NB_weights-NB-loss"),
     )
 ).resolve()
 

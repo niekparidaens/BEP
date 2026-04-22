@@ -59,12 +59,7 @@ split_samples_train = [
 split_samples_val = ["NCBI879", "NCBI880", "NCBI881"]
 split_samples_test_a = ["NCBI882", "NCBI883", "NCBI884"]
 split_samples_test_b = [
-    "NCBI887", "NCBI888", "TENX189", # panel
-    # "NCBI885", "NCBI886", # panel
-    #"NCBI859", # panel
-    # "TENX118", # panel
-    # "TENX141", # panel
-    # "TENX190", # panel
+    "NCBI887", "NCBI888"
 ]
 split_samples_test_c = [
     "TENX191", "TENX192", "TENX193", "TENX194",

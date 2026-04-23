@@ -964,9 +964,9 @@ def collect_eval_rows(model, loader, device):
 
 # Train
 
-epochs = 30
+epochs = 35
 learning_rate = 5e-4
-early_stop_patience = 3
+early_stop_patience = 5
 min_epochs_before_early_stop = 25
 
 model = GeneTokenAutoencoder(

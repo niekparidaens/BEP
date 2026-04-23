@@ -815,8 +815,8 @@ if use_cuda:
     torch.backends.cudnn.benchmark = True
 print(f"Token model device: {device}")
 
-batch_size_cuda = 256
-batch_size_cpu = 64
+batch_size_cuda = 512
+batch_size_cpu = 128
 batch_size = batch_size_cuda if use_cuda else batch_size_cpu
 
 loader_kwargs = {
@@ -964,9 +964,9 @@ def collect_eval_rows(model, loader, device):
 
 # Train
 
-epochs = 1
+epochs = 30
 learning_rate = 5e-4
-early_stop_patience = 10
+early_stop_patience = 3
 min_epochs_before_early_stop = 25
 
 model = GeneTokenAutoencoder(

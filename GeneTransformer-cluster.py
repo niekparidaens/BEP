@@ -85,7 +85,7 @@ UNKNOWN_GENE_TOKEN = "__UNKNOWN_GENE__"
 UNKNOWN_TISSUE_TOKEN = "__UNKNOWN_TISSUE__"
 
 # Exactly like the VAE setup: one deterministic corrupted version per p-value
-p_non_overlap_values = [0.19, 0.21, 0.25, 0.31]
+p_non_overlap_values = [0.19, 0.25, 0.31]
 base_seed = 42
 
 
@@ -602,7 +602,7 @@ train_dataset = GeneTokenDataset(
     split_seed_offset=0,
 )
 
-# Like the VAE: validation and test also use deterministic corrupted inputs
+# Validation and test also use deterministic corrupted inputs
 val_dataset = GeneTokenDataset(
     panel_data=panel_data,
     sample_ids=VAL_SAMPLE_IDS,
@@ -642,11 +642,9 @@ print(
 
 
 # Model
-
 class GeneTokenAutoencoder(nn.Module):
     """
     Tissue-conditioned token autoencoder.
-    No panel embeddings are used anywhere.
     """
 
     def __init__(
@@ -762,9 +760,11 @@ class GeneTokenAutoencoder(nn.Module):
 
 def token_zinb_nll_matrix(mu_logit, pi_logit, theta_unconstrained, target_counts, eps=1e-8):
     target_counts = target_counts.clamp_min(0.0).float()
-    mu_logit = mu_logit.float()
-    pi_logit = pi_logit.float()
-    theta_unconstrained = theta_unconstrained.float()
+
+    # Keep these in float32 and clamp extreme values for numerical stability
+    mu_logit = mu_logit.float().clamp(-20.0, 20.0)
+    pi_logit = pi_logit.float().clamp(-20.0, 20.0)
+    theta_unconstrained = theta_unconstrained.float().clamp(-20.0, 20.0)
 
     mu = F.softplus(mu_logit).clamp_min(eps)
     theta = F.softplus(theta_unconstrained).clamp_min(eps)
@@ -815,7 +815,7 @@ if use_cuda:
     torch.backends.cudnn.benchmark = True
 print(f"Token model device: {device}")
 
-batch_size_cuda = 512
+batch_size_cuda = 256
 batch_size_cpu = 128
 batch_size = batch_size_cuda if use_cuda else batch_size_cpu
 
@@ -964,10 +964,10 @@ def collect_eval_rows(model, loader, device):
 
 # Train
 
-epochs = 35
-learning_rate = 5e-4
+epochs = 25
+learning_rate = 5e-5
 early_stop_patience = 5
-min_epochs_before_early_stop = 25
+min_epochs_before_early_stop = 20
 
 model = GeneTokenAutoencoder(
     n_genes_vocab=len(gene2id),

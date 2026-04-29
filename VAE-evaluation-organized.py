@@ -35,7 +35,7 @@ READ_MODE = os.environ.get("READ_MODE", "r") or "r"
 QUICK_MODE = False
 QUICK_MAX_CELLS = None          # e.g. 20000 for a smoke test
 QUICK_P_VALUES = [0.19]
-FULL_P_VALUES = [0.19]
+FULL_P_VALUES = [0.19, 0.21, 0.25, 0.31]
 
 IO_CHUNK_SIZE = 4096
 PAIR_INFER_BATCH_SIZE = 1024

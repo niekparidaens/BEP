@@ -603,13 +603,13 @@ print(f"Validation examples: {len(val_dataset)} | Test examples: {len(test_datas
 
 # Hyperparameters
 epochs = 40
-beta = 1e-4
+beta = 1e-3
 latent_dim = 16
 hidden_dim = 256
 learning_rate = 5e-4
 early_stop_patience = 41
 theta_init = 10.0
-pi_init = 0.1
+pi_init = 0.1 
 
 # lower if processed gets killed immediately
 batch_size_cuda = 512

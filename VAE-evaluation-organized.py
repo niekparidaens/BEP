@@ -23,7 +23,8 @@ ANN_DIR = Path(os.environ.get("ANN_DIR", PROJECT_ROOT / "AnnData")).resolve()
 SAVE_DIR = Path(os.environ.get("OUTPUT_DIR", PROJECT_ROOT / "outputs" / "vae_eval")).resolve()
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_WEIGHTS_PATH = PROJECT_ROOT / "outputs" / "VAE_ZINB" / "train" / "legacy_from_test_run" / "VAE_ZINB_weights-07-04-2026"
+
+DEFAULT_WEIGHTS_PATH = PROJECT_ROOT / "outputs" / "VAE_ZINB" / "train" / "run-12428205" / "VAE_ZINB_weights-4-p-values"
 WEIGHTS_PATH = Path(os.environ.get("WEIGHTS_PATH", str(DEFAULT_WEIGHTS_PATH))).resolve()
 
 # Keep backed mode on the cluster so we do not pull giant matrices into RAM by accident.

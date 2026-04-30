@@ -1,4 +1,3 @@
-
 import os
 import time
 from pathlib import Path
@@ -60,6 +59,7 @@ val = {
     "Breast": ["TENX197", "TENX198", "TENX199"],
 }
 
+# Kept here only for metadata consistency. This training script does not load/evaluate test panels.
 test_seen_tissue_in_distribution = {
     "Lung": ["NCBI881", "NCBI882"],
     "Breast": ["TENX200", "TENX201", "TENX202"],
@@ -87,7 +87,6 @@ UNKNOWN_TISSUE_TOKEN = "__UNKNOWN_TISSUE__"
 # Exactly like the VAE setup: one deterministic corrupted version per p-value
 p_non_overlap_values = [0.19, 0.25, 0.31]
 base_seed = 42
-
 
 
 # Helpers
@@ -293,8 +292,10 @@ VAL_SAMPLE_IDS = [r["sample_id"] for r in val_records]
 TEST_SAMPLE_IDS = [
     r["sample_id"] for r in (test_id_records + test_shift_records + test_unseen_records)
 ]
-REQUESTED_IDS = sorted(set(TRAIN_SAMPLE_IDS + VAL_SAMPLE_IDS + TEST_SAMPLE_IDS))
 
+# Training script loads only train + validation panels.
+# Test panels should be evaluated in a separate script later.
+REQUESTED_IDS = sorted(set(TRAIN_SAMPLE_IDS + VAL_SAMPLE_IDS))
 
 
 # Load only requested sample IDs
@@ -330,17 +331,15 @@ for sample_id in REQUESTED_IDS:
 
 TRAIN_SAMPLE_IDS = [sid for sid in TRAIN_SAMPLE_IDS if sid in panel_data]
 VAL_SAMPLE_IDS = [sid for sid in VAL_SAMPLE_IDS if sid in panel_data]
-TEST_SAMPLE_IDS = [sid for sid in TEST_SAMPLE_IDS if sid in panel_data]
 
 if len(TRAIN_SAMPLE_IDS) == 0:
     raise ValueError("No training samples are available after loading.")
 if len(VAL_SAMPLE_IDS) == 0:
     raise ValueError("No validation samples are available after loading.")
-if len(TEST_SAMPLE_IDS) == 0:
-    raise ValueError("No test samples are available after loading.")
 
-print(f"Loaded requested panels: {len(panel_data)}")
+print(f"Loaded requested train/validation panels: {len(panel_data)}")
 print(f"Read mode: backed ({READ_MODE})")
+print("Test panels are not loaded/evaluated in this training script.")
 
 if load_failed:
     print(f"Failed to load {len(load_failed)} sample(s):")
@@ -360,7 +359,7 @@ for sid in sorted(panel_data.keys()):
     )
 
 
-# Build cached clean matrices (all requested panels)
+# Build cached clean matrices for train + validation panels only
 
 CACHE_DIR = SAVE_DIR / "panel_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -368,7 +367,6 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 for sid in tqdm(sorted(panel_data.keys()), desc="Ensuring panel caches", unit="panel"):
     cache_path = build_or_load_panel_cache(sid, panel_data[sid], CACHE_DIR)
     panel_data[sid]["cache_path"] = str(cache_path)
-
 
 
 # Vocab / token metadata from train only
@@ -385,7 +383,7 @@ tissue2id = {t: i for i, t in enumerate(tissue_names)}
 
 print(f"Train samples: {len(TRAIN_SAMPLE_IDS)}")
 print(f"Val samples: {len(VAL_SAMPLE_IDS)}")
-print(f"Test samples: {len(TEST_SAMPLE_IDS)}")
+print("Test samples are not loaded/evaluated in this training script.")
 print(f"Vocabulary size (including unknown): {len(gene2id)}")
 print(f"Genes shared across training samples: {len(shared_train_genes)}")
 print(f"Tissues (includes unknown): {tissue2id}")
@@ -602,7 +600,7 @@ train_dataset = GeneTokenDataset(
     split_seed_offset=0,
 )
 
-# Validation and test also use deterministic corrupted inputs
+# Validation also uses deterministic corrupted inputs
 val_dataset = GeneTokenDataset(
     panel_data=panel_data,
     sample_ids=VAL_SAMPLE_IDS,
@@ -617,27 +615,13 @@ val_dataset = GeneTokenDataset(
     split_seed_offset=10_000_000,
 )
 
-test_dataset = GeneTokenDataset(
-    panel_data=panel_data,
-    sample_ids=TEST_SAMPLE_IDS,
-    gene2id=gene2id,
-    shared_genes=shared_train_genes,
-    sample_to_tissue=sample_to_tissue,
-    tissue2id=tissue2id,
-    sample_to_group=sample_to_group,
-    p_non_overlap_values=p_non_overlap_values,
-    base_seed=base_seed,
-    apply_corruption=True,
-    split_seed_offset=20_000_000,
-)
-
 print(
     f"Token dataset cells | train={train_dataset.total_cells} | "
-    f"val={val_dataset.total_cells} | test={test_dataset.total_cells}"
+    f"val={val_dataset.total_cells}"
 )
 print(
     f"Token dataset examples | train={len(train_dataset)} | "
-    f"val={len(val_dataset)} | test={len(test_dataset)}"
+    f"val={len(val_dataset)}"
 )
 
 
@@ -831,10 +815,8 @@ if loader_kwargs["num_workers"] > 0:
 
 train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
 val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
-test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
 
-print(f"train/val/test batches: {len(train_loader)} / {len(val_loader)} / {len(test_loader)}")
-
+print(f"train/val batches: {len(train_loader)} / {len(val_loader)}")
 
 
 # Training / evaluation helpers
@@ -912,7 +894,7 @@ def collect_eval_rows(model, loader, device):
     rows = []
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Token AE eval", unit="batch", leave=False):
+        for batch in tqdm(loader, desc="Token AE validation eval", unit="batch", leave=False):
             gene_ids = batch["gene_ids"].to(device, non_blocking=use_cuda)
             x_vals = batch["x_vals"].to(device, non_blocking=use_cuda)
             y_vals = batch["y_vals"].to(device, non_blocking=use_cuda)
@@ -961,13 +943,22 @@ def collect_eval_rows(model, loader, device):
     return pd.DataFrame(rows)
 
 
+# Train / checkpointed resume training / validation-only evaluation
 
-# Train
+total_epochs = int(os.environ.get("TOTAL_EPOCHS", "20"))
+epochs_this_run = int(os.environ.get("EPOCHS_THIS_RUN", str(total_epochs)))
 
-epochs = 20
 learning_rate = 5e-5
 early_stop_patience = 3
 min_epochs_before_early_stop = 20
+
+CHECKPOINT_DIR = SAVE_DIR / "checkpoints"
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+latest_ckpt_path = CHECKPOINT_DIR / "latest.pt"
+best_ckpt_path = CHECKPOINT_DIR / "best.pt"
+
+resume_checkpoint = os.environ.get("RESUME_CHECKPOINT", "auto")
 
 model = GeneTokenAutoencoder(
     n_genes_vocab=len(gene2id),
@@ -986,88 +977,35 @@ scaler = torch.cuda.amp.GradScaler(enabled=use_cuda)
 hist_train = []
 hist_val = []
 best_val = np.inf
-best_state = None
 best_epoch = 0
 stale = 0
-
-print(
-    f"Training config | epochs={epochs}, lr={learning_rate}, d_model=128, "
-    f"layers=3, nhead=4, latent_dim=32, recon_loss=ZINB(raw counts)"
-)
-
-overall_t0 = time.time()
-epoch_bar = tqdm(range(1, epochs + 1), desc="Token AE epochs", unit="epoch")
-
-for epoch in epoch_bar:
-    epoch_t0 = time.time()
-
-    tr = run_epoch_token_ae(
-        model=model,
-        loader=train_loader,
-        optimizer=optimizer,
-        scaler=scaler,
-        device=device,
-        train=True,
-        epoch_label=f"Epoch {epoch:02d}/{epochs}",
-    )
-    va = run_epoch_token_ae(
-        model=model,
-        loader=val_loader,
-        optimizer=optimizer,
-        scaler=scaler,
-        device=device,
-        train=False,
-        epoch_label=f"Epoch {epoch:02d}/{epochs}",
-    )
-
-    hist_train.append(tr)
-    hist_val.append(va)
-
-    improved = va < (best_val - 1e-8)
-    if improved:
-        best_val = va
-        best_epoch = epoch
-        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        stale = 0
-    else:
-        stale += 1
-
-    if epoch % 5 == 0 or epoch == 1 or improved:
-        print(f"Epoch {epoch:02d}/{epochs} | train_zinb={tr:.6f} | val_zinb={va:.6f}")
-
-    epoch_sec = time.time() - epoch_t0
-    elapsed_sec = time.time() - overall_t0
-    epoch_bar.set_postfix(
-        {
-            "train": f"{tr:.4f}",
-            "val": f"{va:.4f}",
-            "best": best_epoch,
-            "epoch_s": f"{epoch_sec:.1f}",
-            "elapsed_m": f"{elapsed_sec/60:.1f}",
-        }
-    )
-
-    if epoch >= min_epochs_before_early_stop and stale >= early_stop_patience:
-        print(f"Early stopping at epoch {epoch}; best validation loss at epoch {best_epoch}.")
-        break
-
-epoch_bar.close()
-
-if best_state is None:
-    raise RuntimeError("No checkpoint saved for token AE.")
-
-model.load_state_dict(best_state)
-print(f"Loaded best token AE checkpoint from epoch {best_epoch} (val={best_val:.6f})")
+start_epoch = 1
 
 
+def load_checkpoint(path, map_location):
+    """
+    Compatible with both older and newer PyTorch versions.
+    Newer PyTorch versions may need weights_only=False for full checkpoints.
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
-# Save checkpoint / curves / eval
-ckpt_path = SAVE_DIR / "transformer_token_zinb_best.pt"
-torch.save(
-    {
+
+def checkpoint_payload(epoch):
+    return {
+        "epoch": int(epoch),
         "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "hist_train": list(map(float, hist_train)),
+        "hist_val": list(map(float, hist_val)),
+        "best_val": float(best_val),
         "best_epoch": int(best_epoch),
-        "best_val_zinb_nll": float(best_val),
+        "stale": int(stale),
+
+        # Metadata
         "gene_vocab_size": int(len(gene2id)),
         "gene2id": gene2id,
         "tissue2id": tissue2id,
@@ -1076,51 +1014,171 @@ torch.save(
         "unknown_tissue_token": UNKNOWN_TISSUE_TOKEN,
         "train_sample_ids": TRAIN_SAMPLE_IDS,
         "val_sample_ids": VAL_SAMPLE_IDS,
-        "test_sample_ids": TEST_SAMPLE_IDS,
         "p_non_overlap_values": list(map(float, p_non_overlap_values)),
         "threshold": int(threshold),
         "genes_threshold": int(genes_threshold),
-    },
-    ckpt_path,
-)
-print(f"Saved token AE checkpoint to: {ckpt_path}")
+        "total_epochs": int(total_epochs),
+        "learning_rate": float(learning_rate),
+        "model_config": {
+            "d_model": 128,
+            "nhead": 4,
+            "num_layers": 3,
+            "latent_dim": 32,
+            "dropout": 0.1,
+            "theta_init": 10.0,
+        },
+    }
 
-ep = np.arange(1, len(hist_train) + 1)
-plt.figure(figsize=(7, 4))
-plt.plot(ep, hist_train, label="Train", linewidth=2)
-plt.plot(ep, hist_val, label="Validation", linewidth=2)
-plt.xlabel("Epoch")
-plt.ylabel("ZINB NLL")
-plt.title("Transformer token AE learning curves (ZINB)")
-plt.grid(alpha=0.25)
-plt.legend()
-plt.tight_layout()
-curve_path = SAVE_DIR / "transformer_token_zinb_learning_curves.png"
-plt.savefig(curve_path, dpi=300, bbox_inches="tight")
-plt.close()
-print(f"Saved learning curves to: {curve_path}")
 
-val_eval = collect_eval_rows(model, val_loader, device)
-test_eval = collect_eval_rows(model, test_loader, device)
+# Resume logic
+resume_path = None
 
-val_eval_path = SAVE_DIR / "transformer_token_zinb_val_metrics.csv"
-test_eval_path = SAVE_DIR / "transformer_token_zinb_test_metrics.csv"
-val_eval.to_csv(val_eval_path, index=False)
-test_eval.to_csv(test_eval_path, index=False)
+if resume_checkpoint.lower() == "auto":
+    if latest_ckpt_path.exists():
+        resume_path = latest_ckpt_path
+elif resume_checkpoint.lower() not in {"", "none", "false", "0"}:
+    resume_path = Path(resume_checkpoint)
 
-print(f"Saved validation metrics to: {val_eval_path}")
-print(f"Saved test metrics to: {test_eval_path}")
+if resume_path is not None and resume_path.exists():
+    print(f"Resuming from checkpoint: {resume_path}")
 
-print("Validation summary:")
+    ckpt = load_checkpoint(resume_path, map_location=device)
+
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+    if "scaler_state_dict" in ckpt:
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+
+    hist_train = list(ckpt.get("hist_train", []))
+    hist_val = list(ckpt.get("hist_val", []))
+
+    best_val = float(ckpt.get("best_val", np.inf))
+    best_epoch = int(ckpt.get("best_epoch", 0))
+    stale = int(ckpt.get("stale", 0))
+
+    start_epoch = int(ckpt["epoch"]) + 1
+
+    print(
+        f"Continuing at epoch {start_epoch}. "
+        f"Best so far: epoch {best_epoch}, val={best_val:.6f}"
+    )
+else:
+    print("Starting from scratch.")
+
+
+end_epoch = min(total_epochs, start_epoch + epochs_this_run - 1)
+
 print(
-    val_eval.groupby(["split_group", "p_non_overlap"])[
-        ["mse_all", "mse_shared", "mse_specific", "zinb_nll_all"]
-    ].mean(numeric_only=True)
+    f"Training config | total_epochs={total_epochs}, this_run={start_epoch}-{end_epoch}, "
+    f"lr={learning_rate}, d_model=128, layers=3, nhead=4, latent_dim=32, "
+    f"recon_loss=ZINB(raw counts)"
 )
 
-print("Test summary:")
-print(
-    test_eval.groupby(["split_group", "p_non_overlap"])[
-        ["mse_all", "mse_shared", "mse_specific", "zinb_nll_all"]
-    ].mean(numeric_only=True)
-)
+if start_epoch > total_epochs:
+    print(
+        f"Already trained to epoch {start_epoch - 1}; "
+        f"total_epochs={total_epochs}. No additional training needed."
+    )
+else:
+    overall_t0 = time.time()
+
+    epoch_bar = tqdm(
+        range(start_epoch, end_epoch + 1),
+        desc="Token AE epochs",
+        unit="epoch",
+    )
+
+    for epoch in epoch_bar:
+        epoch_t0 = time.time()
+
+        tr = run_epoch_token_ae(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            train=True,
+            epoch_label=f"Epoch {epoch:02d}/{total_epochs}",
+        )
+
+        va = run_epoch_token_ae(
+            model=model,
+            loader=val_loader,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            train=False,
+            epoch_label=f"Epoch {epoch:02d}/{total_epochs}",
+        )
+
+        hist_train.append(tr)
+        hist_val.append(va)
+
+        improved = va < (best_val - 1e-8)
+
+        if improved:
+            best_val = va
+            best_epoch = epoch
+            stale = 0
+
+            torch.save(checkpoint_payload(epoch), best_ckpt_path)
+            print(f"Saved new best checkpoint: {best_ckpt_path}")
+        else:
+            stale += 1
+
+        # Save latest checkpoint after every epoch
+        epoch_ckpt_path = CHECKPOINT_DIR / f"epoch_{epoch:03d}.pt"
+
+        payload = checkpoint_payload(epoch)
+        torch.save(payload, epoch_ckpt_path)
+        torch.save(payload, latest_ckpt_path)
+
+        print(
+            f"Epoch {epoch:02d}/{total_epochs} | "
+            f"train_zinb={tr:.6f} | val_zinb={va:.6f} | "
+            f"best_epoch={best_epoch} | latest={latest_ckpt_path}"
+        )
+
+        epoch_sec = time.time() - epoch_t0
+        elapsed_sec = time.time() - overall_t0
+
+        epoch_bar.set_postfix(
+            {
+                "train": f"{tr:.4f}",
+                "val": f"{va:.4f}",
+                "best": best_epoch,
+                "epoch_s": f"{epoch_sec:.1f}",
+                "elapsed_m": f"{elapsed_sec / 60:.1f}",
+            }
+        )
+
+        if epoch >= min_epochs_before_early_stop and stale >= early_stop_patience:
+            print(
+                f"Early stopping at epoch {epoch}; "
+                f"best validation loss was at epoch {best_epoch}."
+            )
+            break
+
+    epoch_bar.close()
+
+
+if not best_ckpt_path.exists():
+    raise RuntimeError("No best checkpoint exists. Training probably did not finish one epoch.")
+
+best_ckpt = load_checkpoint(best_ckpt_path, map_location=device)
+
+model.load_state_dict(best_ckpt["model_state_dict"])
+best_epoch = int(best_ckpt["best_epoch"])
+best_val = float(best_ckpt["best_val"])
+hist_train = list(best_ckpt.get("hist_train", hist_train))
+hist_val = list(best_ckpt.get("hist_val", hist_val))
+
+print(f"Loaded best token AE checkpoint from epoch {best_epoch} with val={best_val:.6f}")
+
+
+# Save final best checkpoint copy
+final_ckpt_path = SAVE_DIR / "transformer_token_zinb_best.pt"
+torch.save(best_ckpt, final_ckpt_path)
+print(f"Saved final best token AE checkpoint to: {final_ckpt_path}")
+

@@ -35,9 +35,8 @@ MODEL_LATENT_DIM = int(os.environ.get("MODEL_LATENT_DIM", 32))
 MODEL_DROPOUT = float(os.environ.get("MODEL_DROPOUT", 0.1))
 MODEL_THETA_INIT = float(os.environ.get("MODEL_THETA_INIT", 10.0))
 
-# -----------------------------------------------------------------------------
+
 # Evaluation options
-# -----------------------------------------------------------------------------
 QUICK_MODE = False
 QUICK_MAX_CELLS = None
 QUICK_P_VALUES = [0.19, 0.25, 0.31]
@@ -446,6 +445,11 @@ def compute_valid_overlap_gene_mask(gene_names, train_gene_name_set):
 # Model
 # -----------------------------------------------------------------------------
 class GeneTokenAutoencoder(nn.Module):
+    """
+    Tissue-conditioned token autoencoder.
+    Must match the checkpointed training architecture exactly.
+    """
+
     def __init__(
         self,
         n_genes_vocab,
@@ -464,9 +468,11 @@ class GeneTokenAutoencoder(nn.Module):
 
         self.value_mlp = nn.Sequential(
             nn.Linear(1, d_model),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(d_model, d_model),
         )
+
+        self.input_norm = nn.LayerNorm(d_model)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -475,18 +481,31 @@ class GeneTokenAutoencoder(nn.Module):
             dropout=dropout,
             batch_first=True,
             activation="gelu",
+            norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.post_encoder_norm = nn.LayerNorm(d_model)
 
-        self.latent_proj = nn.Linear(d_model, latent_dim)
-        self.z_proj = nn.Linear(latent_dim, d_model)
+        self.latent_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, latent_dim),
+        )
+
+        self.z_proj = nn.Sequential(
+            nn.Linear(latent_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
 
         self.decoder_trunk = nn.Sequential(
             nn.Linear(3 * d_model, 2 * d_model),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(2 * d_model, d_model),
             nn.GELU(),
         )
+
         self.mu_head = nn.Linear(d_model, 1)
         self.pi_head = nn.Linear(d_model, 1)
 
@@ -499,39 +518,55 @@ class GeneTokenAutoencoder(nn.Module):
         x = self.value_mlp(x_vals.unsqueeze(-1))
         t = self.tissue_emb(tissue_id).unsqueeze(1)
 
-        h = g + x + t
+        h = self.input_norm(g + x + t)
+
         pad_mask = ~attn_mask
         h = self.encoder(h, src_key_padding_mask=pad_mask)
+        h = self.post_encoder_norm(h)
 
         mask_f = attn_mask.unsqueeze(-1).float()
         pooled = (h * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
+
         z = self.latent_proj(pooled)
         return z
 
     def decode_params(self, z, gene_ids, tissue_id):
         B, L = gene_ids.shape
+
         zg = self.z_proj(z).unsqueeze(1).expand(B, L, -1)
         g = self.gene_emb(gene_ids)
         t = self.tissue_emb(tissue_id).unsqueeze(1).expand(B, L, -1)
 
         dec_in = torch.cat([zg, g, t], dim=-1)
         h = self.decoder_trunk(dec_in)
+
         mu_logit = self.mu_head(h).squeeze(-1)
         pi_logit = self.pi_head(h).squeeze(-1)
         theta_unconstrained = self.log_theta_gene(gene_ids).squeeze(-1)
+
         return mu_logit, pi_logit, theta_unconstrained
 
     def forward_with_params(self, gene_ids, x_vals, attn_mask, tissue_id):
         z = self.encode(gene_ids, x_vals, attn_mask, tissue_id)
-        mu_logit, pi_logit, theta_unconstrained = self.decode_params(z, gene_ids, tissue_id)
+        mu_logit, pi_logit, theta_unconstrained = self.decode_params(
+            z,
+            gene_ids,
+            tissue_id,
+        )
 
         mu = F.softplus(mu_logit)
         pi = torch.sigmoid(pi_logit)
         recon_counts = (1.0 - pi) * mu
+
         return recon_counts, z, mu_logit, pi_logit, theta_unconstrained
 
     def forward(self, gene_ids, x_vals, attn_mask, tissue_id):
-        recon_counts, z, _, _, _ = self.forward_with_params(gene_ids, x_vals, attn_mask, tissue_id)
+        recon_counts, z, _, _, _ = self.forward_with_params(
+            gene_ids=gene_ids,
+            x_vals=x_vals,
+            attn_mask=attn_mask,
+            tissue_id=tissue_id,
+        )
         return recon_counts, z
 
 
@@ -2192,22 +2227,32 @@ def main():
     if UNKNOWN_TISSUE_TOKEN not in tissue2id:
         raise KeyError(f"Checkpoint tissue2id is missing {UNKNOWN_TISSUE_TOKEN}.")
 
+    model_config = ckpt.get("model_config", {})
+
+    d_model = int(model_config.get("d_model", MODEL_D_MODEL))
+    nhead = int(model_config.get("nhead", MODEL_NHEAD))
+    num_layers = int(model_config.get("num_layers", MODEL_NUM_LAYERS))
+    latent_dim = int(model_config.get("latent_dim", MODEL_LATENT_DIM))
+    dropout = float(model_config.get("dropout", MODEL_DROPOUT))
+    theta_init = float(model_config.get("theta_init", MODEL_THETA_INIT))
+
     model = GeneTokenAutoencoder(
         n_genes_vocab=int(len(gene2id)),
         n_tissues=int(len(tissue2id)),
-        d_model=MODEL_D_MODEL,
-        nhead=MODEL_NHEAD,
-        num_layers=MODEL_NUM_LAYERS,
-        latent_dim=MODEL_LATENT_DIM,
-        dropout=MODEL_DROPOUT,
-        theta_init=MODEL_THETA_INIT,
+        d_model=d_model,
+        nhead=nhead,
+        num_layers=num_layers,
+        latent_dim=latent_dim,
+        dropout=dropout,
+        theta_init=theta_init,
     ).to(device)
+
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
     model.eval()
 
     print(
         f"Loaded checkpoint | gene_vocab={len(gene2id)}, tissues={len(tissue2id)}, "
-        f"d_model={MODEL_D_MODEL}, nhead={MODEL_NHEAD}, num_layers={MODEL_NUM_LAYERS}, latent={MODEL_LATENT_DIM}"
+        f"d_model={d_model}, nhead={nhead}, num_layers={num_layers}, latent={latent_dim}"
     )
     if ckpt.get("best_epoch") is not None:
         print(f"Checkpoint best_epoch: {ckpt['best_epoch']}")

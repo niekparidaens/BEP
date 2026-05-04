@@ -40,8 +40,8 @@ MODEL_THETA_INIT = float(os.environ.get("MODEL_THETA_INIT", 10.0))
 # -----------------------------------------------------------------------------
 QUICK_MODE = False
 QUICK_MAX_CELLS = None
-QUICK_P_VALUES = [0.19]
-FULL_P_VALUES = [0.19]
+QUICK_P_VALUES = [0.19, 0.25, 0.31]
+FULL_P_VALUES = [0.19, 0.25, 0.31]
 
 IO_CHUNK_SIZE = 2048
 PAIR_INFER_BATCH_SIZE = 512

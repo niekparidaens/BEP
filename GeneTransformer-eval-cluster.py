@@ -2266,9 +2266,20 @@ def main():
     test_c_records = flatten_simple_split_dict(test_unseen_tissue, "test", "C")
     all_records = train_records + val_records + test_a_records + test_b_records + test_c_records
 
+    
     panel_to_tissue = {r["sample_id"]: r["tissue_name"] for r in all_records}
     panel_to_group = {r["sample_id"]: r["split_group"] for r in all_records}
     panel_to_split = {r["sample_id"]: r["split_name"] for r in all_records}
+
+    # Pair-analysis source panel TENX189 is not in the normal split dictionaries.
+    # Give it the same tissue label as the target panel if they are matched.
+    if PAIR_5K_ID not in panel_to_tissue and PAIR_V1_ID in panel_to_tissue:
+        panel_to_tissue[PAIR_5K_ID] = panel_to_tissue[PAIR_V1_ID]
+        panel_to_group[PAIR_5K_ID] = "pair_source"
+        panel_to_split[PAIR_5K_ID] = "pair"
+
+    print(f"Pair source {PAIR_5K_ID} tissue: {panel_to_tissue.get(PAIR_5K_ID, UNKNOWN_TISSUE_TOKEN)}")
+    print(f"Pair target {PAIR_V1_ID} tissue: {panel_to_tissue.get(PAIR_V1_ID, UNKNOWN_TISSUE_TOKEN)}")
 
     train_sample_ids = [r["sample_id"] for r in train_records]
     val_sample_ids = [r["sample_id"] for r in val_records]
